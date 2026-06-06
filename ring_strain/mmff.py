@@ -114,8 +114,9 @@ class MMFFCalculator:
         if n_heavy < 1:
             raise ValueError("Molecule has no heavy atoms.")
 
-        # Adjust conformer count for very small molecules
-        effective_n_conf = min(self.n_conformers, max(1, 50 * n_heavy))
+        # Adaptive conformer count: rigid molecules need far fewer samples
+        # than flexible ones. Measure flexibility by rotatable bonds count.
+        effective_n_conf = self._compute_effective_conformers(mol)
 
         # Suppress C++ stderr noise during the conformer+optimize phase.
         # RDKit's BFGS optimizer can emit "Invariant Violation: bad
@@ -124,7 +125,7 @@ class MMFFCalculator:
         # This is non-fatal — RDKit handles it internally and convergence
         # still succeeds — but the C++ output bypasses Python's logging.
         with _suppress_cpp_stderr():
-            conf_ids = self.generate_conformers(mol)
+            conf_ids = self.generate_conformers(mol, n_conformers=effective_n_conf)
             if not conf_ids:
                 raise RuntimeError(
                     f"Failed to generate any conformers for molecule with "
@@ -175,13 +176,29 @@ class MMFFCalculator:
 
         return ff.CalcEnergy()
 
-    def generate_conformers(self, mol: Mol) -> List[int]:
+    def generate_conformers(
+        self, mol: Mol, n_conformers: Optional[int] = None
+    ) -> List[int]:
         """Generate diverse conformers using ETKDG or standard DG.
 
         The molecule must already have explicit hydrogens added.
 
+        Parameters
+        ----------
+        n_conformers : Optional[int]
+            Number of conformers to embed. Defaults to ``self.n_conformers``.
+            Callers pass the adaptive (flexibility-based) count here so that
+            rigid molecules are not oversampled.
+
         Returns a list of conformer IDs that were successfully embedded.
+
+        Embedding is parallelized across all available cores (numThreads=0).
+        With a fixed randomSeed, RDKit assigns deterministic per-conformer
+        seeds, so results are reproducible regardless of thread count.
         """
+        if n_conformers is None:
+            n_conformers = self.n_conformers
+
         # Strategy 1: ETKDG with torsion preferences and small-ring corrections
         # (best for most organic molecules, especially ring systems)
         conf_ids = []
@@ -189,11 +206,12 @@ class MMFFCalculator:
             conf_ids = list(
                 rdDistGeom.EmbedMultipleConfs(
                     mol,
-                    numConfs=self.n_conformers,
+                    numConfs=n_conformers,
                     randomSeed=self.random_seed,
                     useExpTorsionAnglePrefs=self.use_etkdg,
                     useBasicKnowledge=True,
                     useSmallRingTorsions=True,
+                    numThreads=0,
                 )
             )
         except Exception:
@@ -210,11 +228,12 @@ class MMFFCalculator:
                 conf_ids = list(
                     rdDistGeom.EmbedMultipleConfs(
                         mol,
-                        numConfs=self.n_conformers,
+                        numConfs=n_conformers,
                         randomSeed=self.random_seed,
                         useExpTorsionAnglePrefs=False,
                         useBasicKnowledge=True,
                         useSmallRingTorsions=True,
+                        numThreads=0,
                     )
                 )
             except Exception:
@@ -231,10 +250,11 @@ class MMFFCalculator:
                 conf_ids = list(
                     rdDistGeom.EmbedMultipleConfs(
                         mol,
-                        numConfs=min(self.n_conformers, 100),
+                        numConfs=min(n_conformers, 100),
                         randomSeed=self.random_seed,
                         useRandomCoords=True,
                         useBasicKnowledge=False,
+                        numThreads=0,
                     )
                 )
             except Exception as exc:
@@ -320,14 +340,68 @@ class MMFFCalculator:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _compute_effective_conformers(self, mol: Mol) -> int:
+        """Return an adaptive conformer count based on molecular flexibility.
+
+        Rigid ring systems (no rotatable bonds) need few conformers —
+        sampling 200 is wasteful for cyclopropane or cubane. Flexible
+        molecules with many rotatable bonds get the full requested count.
+
+        Formula: base 10 + 10 per rotatable bond + 5 per ring, clamped to
+        [10, self.n_conformers].
+        """
+        n_heavy = CalcNumHeavyAtoms(mol)
+        if n_heavy <= 1:
+            return 1
+
+        n_rot_bonds = Chem.rdMolDescriptors.CalcNumRotatableBonds(mol)
+        n_rings = Chem.rdMolDescriptors.CalcNumRings(mol)
+
+        effective = 10 + 10 * n_rot_bonds + 5 * n_rings
+        effective = max(5, min(self.n_conformers, effective))
+
+        logger.debug(
+            "Adaptive conformers: heavy=%d rot_bonds=%d rings=%d → %d",
+            n_heavy, n_rot_bonds, n_rings, effective,
+        )
+        return effective
+
     def _optimize_all_conformers(
         self, mol: Mol, conf_ids: List[int]
     ) -> Tuple[int, float, bool]:
-        """Optimize all conformers, return (best_conf_id, best_energy, all_converged)."""
+        """Optimize all conformers, return (best_conf_id, best_energy, all_converged).
+
+        Uses RDKit's native batch optimizer (MMFFOptimizeMoleculeConfs) with
+        numThreads=0, which minimizes every conformer in parallel C++ threads
+        instead of a serial Python loop. Falls back to the serial loop if the
+        batch call is unavailable or raises.
+        """
+        try:
+            results = AllChem.MMFFOptimizeMoleculeConfs(
+                mol,
+                numThreads=0,
+                maxIters=self.max_optimization_iters,
+            )
+        except Exception:
+            results = None
+
+        if results:
+            best_energy = float("inf")
+            best_conf_id = -1
+            all_converged = True
+            for conf_id, (not_converged, energy) in zip(conf_ids, results):
+                if not_converged != 0:
+                    all_converged = False
+                if energy < best_energy:
+                    best_energy = energy
+                    best_conf_id = conf_id
+            if best_conf_id != -1:
+                return best_conf_id, best_energy, all_converged
+
+        # Fallback: serial per-conformer minimization
         best_energy = float("inf")
         best_conf_id = -1
         all_converged = True
-
         for conf_id in conf_ids:
             energy, converged = self.optimize_conformer(mol, conf_id)
             if not converged:

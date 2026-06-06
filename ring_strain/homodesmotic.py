@@ -20,6 +20,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Module-level caches for expensive MMFF94-to-MMFF94 constants
+# (ethane energy and per-ring-size cycloalkane strain are immutable once computed)
+# ---------------------------------------------------------------------------
+_ETHANE_ENERGY: Optional[float] = None
+_CYCLOALKANE_STRAIN_CACHE: Dict[int, float] = {}
+
 
 # ---------------------------------------------------------------------------
 # Reaction representation
@@ -257,7 +264,15 @@ class HomodesmoticAnalyzer:
         strict bond-balanced reaction scheme.
 
         Returns raw MMFF94 strain in kcal/mol.
+
+        Results are cached at module level — these are physical constants
+        for a given MMFF94 parameter set and ring size.
         """
+        global _ETHANE_ENERGY, _CYCLOALKANE_STRAIN_CACHE
+
+        if ring_size in _CYCLOALKANE_STRAIN_CACHE:
+            return _CYCLOALKANE_STRAIN_CACHE[ring_size]
+
         reaction = self.build_cycloalkane_homodesmotic_reaction(ring_size)
         if reaction is None:
             return None
@@ -267,16 +282,18 @@ class HomodesmoticAnalyzer:
             cyclic_result = self.mmff.embed_and_optimize(cyclic_mol)
             cyclic_energy = cyclic_result.total_energy
 
-            ethane_mol = Chem.MolFromSmiles("CC")
-            ethane_result = self.mmff.embed_and_optimize(ethane_mol)
-            ethane_energy = ethane_result.total_energy
+            if _ETHANE_ENERGY is None:
+                ethane_mol = Chem.MolFromSmiles("CC")
+                ethane_result = self.mmff.embed_and_optimize(ethane_mol)
+                _ETHANE_ENERGY = ethane_result.total_energy
 
             linear_mol = Chem.MolFromSmiles(reaction.acyclic_product_smiles)
             linear_result = self.mmff.embed_and_optimize(linear_mol)
             linear_energy = linear_result.total_energy
 
             # E_strain = E(cyclic) + E(ethane) - E(linear)
-            strain = cyclic_energy + ethane_energy - linear_energy
+            strain = cyclic_energy + _ETHANE_ENERGY - linear_energy
+            _CYCLOALKANE_STRAIN_CACHE[ring_size] = strain
             return strain
 
         except Exception as exc:
@@ -293,8 +310,16 @@ class HomodesmoticAnalyzer:
 
     @staticmethod
     def _is_simple_carbocycle(mol: Mol, ring_info: RingSystemInfo) -> bool:
-        """Check if molecule is a simple monocyclic carbocycle (no heteroatoms,
-        no aromatics, single ring, all carbons)."""
+        """Check if molecule is a simple saturated monocyclic carbocycle
+        (no heteroatoms, no aromatics, single ring, all sp3 carbons,
+        no double/triple bonds anywhere).
+
+        The strict bond-balanced cycloalkane shortcut models the ring as
+        a fully saturated cyclo-(CH2)n. It must NOT be used for unsaturated
+        rings (e.g. cyclohexene C1CCCC=C1) or rings bearing unsaturated
+        substituents, otherwise their strain would be computed as if they
+        were the corresponding saturated cycloalkane.
+        """
         if ring_info.num_rings != 1:
             return False
         ring = ring_info.rings[0]
@@ -305,6 +330,12 @@ class HomodesmoticAnalyzer:
         # Verify all atoms are carbon
         for atom in mol.GetAtoms():
             if atom.GetAtomicNum() != 6:
+                return False
+        # Verify the molecule is fully saturated: every bond must be a
+        # single bond. Any double/triple (or aromatic) bond means the
+        # saturated-cycloalkane model does not apply.
+        for bond in mol.GetBonds():
+            if bond.GetBondType() != rdchem.BondType.SINGLE:
                 return False
         return True
 

@@ -185,9 +185,6 @@ class StrainAnalyzer:
         self.scorer = StabilityScorer(threshold_kcal_mol=stability_threshold)
         self.homo_analyzer = HomodesmoticAnalyzer(self.mmff_calc)
 
-        # Pre-build calibration
-        self.calibrator.build_calibration()
-
     # ------------------------------------------------------------------
     # Main API
     # ------------------------------------------------------------------

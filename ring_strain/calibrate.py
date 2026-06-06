@@ -28,6 +28,10 @@ class StrainCalibrator:
     applies them to arbitrary ring systems, and handles polycyclic
     decomposition.
 
+    Calibration factors are cached at class level — the reference data
+    and MMFF94 force field are deterministic, so calibration needs to
+    run only once per process.
+
     Parameters
     ----------
     reference_db : ReferenceDatabase
@@ -35,6 +39,10 @@ class StrainCalibrator:
     mmff_calc : MMFFCalculator
         For computing raw MMFF94 strain of reference compounds.
     """
+
+    # Class-level cache: calibration is deterministic, run once globally
+    _factors_cache: Optional[Dict[int, float]] = None
+    _interpolator_cache: Optional[interp1d] = None
 
     def __init__(
         self,
@@ -60,10 +68,17 @@ class StrainCalibrator:
         For each ring size in the reference database, computes the ratio
         experimental_strain / raw_mmff_strain and stores the mean.
 
+        Results are cached at class level — the reference data and MMFF94
+        force field are deterministic, so calibration runs only once per
+        process regardless of how many StrainAnalyzer instances are created.
+
         Returns:
             {ring_size: correction_factor}
         """
-        if self._calibrated:
+        if StrainCalibrator._factors_cache is not None:
+            self._factors = dict(StrainCalibrator._factors_cache)
+            self._interpolator = StrainCalibrator._interpolator_cache
+            self._calibrated = True
             return dict(self._factors)
 
         pairs = self.ref_db.get_calibration_pairs()
@@ -122,6 +137,11 @@ class StrainCalibrator:
             )
 
         self._calibrated = True
+
+        # Persist to class-level cache so future instances skip computation
+        StrainCalibrator._factors_cache = dict(self._factors)
+        StrainCalibrator._interpolator_cache = self._interpolator
+
         return dict(self._factors)
 
     # ------------------------------------------------------------------
