@@ -1,247 +1,388 @@
 """
 Homodesmotic ring strain energy calculation.
 
-Constructs balanced homodesmotic reactions where a cyclic molecule is
-compared to an acyclic reference that preserves bond types and
-hybridization. Computes raw MMFF94 ring strain energy.
+For unsubstituted cycloalkanes, uses the strict bond-balanced reaction:
+    cyclo-(CH2)n + CH3-CH3  ->  CH3-(CH2)(n+1)-CH3
+
+For substituted cycloalkanes, uses ring-opening with H-capping:
+    strain = E(cyclic) - E(acyclic_H_capped)
+The ring bond chosen for opening is the one connecting the two most-
+substituted ring atoms, so the resulting acyclic chain places bulky
+substituents far apart (avoiding artificial steric clashes that strict
+CH3-capping would introduce when caps sit next to bulky groups).
 """
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from rdkit import Chem
-from rdkit.Chem import rdchem, rdmolops
+from rdkit.Chem import rdchem
 from rdkit.Chem.rdchem import Mol, RWMol
 
 from .mmff import MMFFCalculator, MMFFResult
-from .ring_analysis import RingAnalyzer, RingInfo, RingSystemInfo
+from .ring_analysis import RingInfo, _get_ring_bonds
 
 import logging
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Module-level caches for expensive MMFF94-to-MMFF94 constants
-# (ethane energy and per-ring-size cycloalkane strain are immutable once computed)
-# ---------------------------------------------------------------------------
+# Module-level caches for immutable MMFF94 constants
 _ETHANE_ENERGY: Optional[float] = None
 _CYCLOALKANE_STRAIN_CACHE: Dict[int, float] = {}
 
-
-# ---------------------------------------------------------------------------
-# Reaction representation
-# ---------------------------------------------------------------------------
 
 @dataclass
 class HomodesmoticReaction:
     """Representation of a homodesmotic strain analysis reaction."""
     cyclic_reactant_smiles: str
     acyclic_product_smiles: str
-    auxiliary_reactants: List[str]    # e.g. ['CC'] for ethane
+    auxiliary_reactants: List[str]
     auxiliary_products: List[str]
     reaction_smarts: str
     description: str
 
 
-# ---------------------------------------------------------------------------
-# Analyzer
-# ---------------------------------------------------------------------------
-
 class HomodesmoticAnalyzer:
     """Compute ring strain via homodesmotic reaction method.
 
-    For each ring system, constructs a balanced reaction where the cyclic
-    molecule is transformed into an acyclic analog that preserves bond
-    types and hybridization states.
+    - Unsubstituted cycloalkanes: strict bond-balanced reaction
+        cyclo-(CH2)n + CH3-CH3  ->  CH3-(CH2)(n+1)-CH3
+      Precomputed from cycloalkane SMILES, cached by ring size.
 
-    Strain energy = sum(E_products) - sum(E_reactants)
-
-    Parameters
-    ----------
-    mmff_calc : MMFFCalculator
-        MMFF94 calculator for geometry optimization and energy.
+    - Substituted cycloalkanes: ring-opening with H-capping.
+      Strain = E(cyclic) - E(acyclic_H_capped).
+      The ring bond to break is selected as the one connecting the two
+      most-substituted ring atoms, so the resulting linear chain places
+      bulky substituents at opposite ends.
     """
 
     def __init__(self, mmff_calc: MMFFCalculator):
         self.mmff = mmff_calc
 
-    # ------------------------------------------------------------------
-    # Main computation
-    # ------------------------------------------------------------------
-
-    def compute_total_strain(
+    def compute_strain(
         self,
         mol: Mol,
-        ring_info: RingSystemInfo,
-    ) -> Tuple[float, Dict[int, float], Dict[str, float]]:
-        """Compute total raw MMFF94 ring strain energy.
+        ring_info: RingInfo,
+        cyclic_mol: Optional[Mol] = None,
+        cyclic_energy_override: Optional[float] = None,
+        acyclic_energy_override: Optional[float] = None,
+        use_boltzmann: bool = True,
+    ) -> Tuple[float, Dict[str, float]]:
+        """Compute raw MMFF94 ring strain energy.
 
-        For monocyclic systems: direct homodesmotic comparison.
-        For polycyclic systems: sequential ring opening.
+        Args:
+            mol: Original molecule (implicit hydrogens, no conformers needed).
+            ring_info: Validated ring information.
+            cyclic_mol: Pre-optimized cyclic molecule with explicit hydrogens
+                and conformers. If provided, its best-conformer energy is
+                used directly without re-optimization.
+            cyclic_energy_override: If provided, used directly as the cyclic
+                energy. For Boltzmann-weighted thermal energy.
+            acyclic_energy_override: If provided, used directly as the acyclic
+                energy. When both overrides are given, the method uses them
+                directly for the strain calculation.
+            use_boltzmann: When True (default) and the molecule is substituted,
+                the acyclic reference also gets Boltzmann thermal averaging,
+                matching the cyclic side treatment.
 
         Returns:
-            (total_strain_kcal_mol, per_ring_strain, energy_components)
+            (strain_kcal_mol, energy_components)
         """
-        if ring_info.num_rings == 0:
-            return 0.0, {}, {"cyclic_energy": 0.0, "acyclic_energy": 0.0}
-
         # Get energy of the cyclic form
-        try:
+        if cyclic_energy_override is not None:
+            cyclic_energy = cyclic_energy_override
+        elif cyclic_mol is not None:
+            cyclic_energy = self.mmff.compute_single_point_energy(cyclic_mol)
+        else:
             cyclic_result = self.mmff.embed_and_optimize(Chem.Mol(mol))
             cyclic_energy = cyclic_result.total_energy
-        except Exception as exc:
-            logger.error("MMFF94 failed for cyclic molecule: %s", exc)
-            raise
 
-        # For simple monocyclic cycloalkanes, use the strict bond-balanced
-        # homodesmotic method (more accurate than generic ring-opening).
-        if self._is_simple_carbocycle(mol, ring_info):
-            ring_size = ring_info.rings[0].size
-            strain = self.compute_cycloalkane_strain(ring_size)
+        # For unsubstituted cycloalkanes: strict bond-balanced method
+        if _is_unsubstituted_cycloalkane(mol, ring_info):
+            strain = self.compute_cycloalkane_strain(ring_info.size)
             if strain is not None:
-                per_ring = {0: strain}
                 components = {
                     "cyclic_energy": cyclic_energy,
                     "acyclic_energy": cyclic_energy - strain,
+                    "method": "strict homodesmotic",
                 }
-                return strain, per_ring, components
+                return strain, components
 
-        # For aromatics: ring-opening is problematic because delocalized
-        # bonds can't be trivially broken. Treat aromatic rings as having
-        # zero homodesmotic strain (resonance stabilization compensates).
-        if self._is_aromatic_system(ring_info):
-            per_ring = {r.ring_index: 0.0 for r in ring_info.rings}
+        # For substituted cycloalkanes: ring-opening with H-capping.
+        acyclic_mol_for_decomp: Optional[Mol] = None
+        if acyclic_energy_override is not None:
+            acyclic_energy = acyclic_energy_override
             components = {
                 "cyclic_energy": cyclic_energy,
-                "acyclic_energy": cyclic_energy,
-                "aromatic_bypass": True,
+                "acyclic_energy": acyclic_energy,
+                "method": "ring-opening + Boltzmann (substituted)",
             }
-            return 0.0, per_ring, components
-
-        # Build acyclic reference and compute its energy
-        try:
-            acyclic_mol, _ = self._build_acyclic_reference(Chem.Mol(mol), ring_info)
-            acyclic_result = self.mmff.embed_and_optimize(acyclic_mol)
-            acyclic_energy = acyclic_result.total_energy
-        except Exception as exc:
-            logger.error(
-                "MMFF94 failed for acyclic reference: %s. "
-                "Falling back to per-heavy-atom comparison.",
-                exc,
+        else:
+            acyclic_mol_for_decomp, acyclic_energy = (
+                self._compute_acyclic_energy_with_mol(
+                    mol, ring_info, use_boltzmann=use_boltzmann,
+                )
             )
-            return self._fallback_strain(mol, cyclic_result, ring_info)
+            method = (
+                "ring-opening + Boltzmann (substituted)"
+                if use_boltzmann
+                else "ring-opening (substituted)"
+            )
+            components = {
+                "cyclic_energy": cyclic_energy,
+                "acyclic_energy": acyclic_energy,
+                "method": method,
+            }
 
         raw_strain = cyclic_energy - acyclic_energy
 
-        # Per-ring attribution
-        per_ring = self._allocate_strain_to_rings(
-            mol, raw_strain, ring_info
+        # MMFF94 per-term decomposition of the cyclic vs acyclic geometries.
+        # The vdW component is the physically meaningful "steric strain" — the
+        # extra non-bonded repulsion the substituents experience in the ring
+        # vs the open chain. Torsion captures Pitzer-like eclipsing; angle
+        # captures Baeyer-like bond-angle deformation; bond captures stretch.
+        # Decomposition uses single representative geometries (the conformer
+        # currently on each mol), so the terms are diagnostic snapshots —
+        # they will not sum exactly to raw_strain when Boltzmann averaging
+        # is in effect on either side.
+        if cyclic_mol is not None and acyclic_mol_for_decomp is not None:
+            try:
+                cyc_dec = self.mmff.decompose_energy(cyclic_mol)
+                acyc_dec = self.mmff.decompose_energy(acyclic_mol_for_decomp)
+                for term, key in (
+                    ("vdw", "vdw_strain"),
+                    ("torsion", "torsion_strain"),
+                    ("angle", "angle_strain"),
+                    ("bond", "bond_strain"),
+                ):
+                    c_val = cyc_dec.get(term, float("nan"))
+                    a_val = acyc_dec.get(term, float("nan"))
+                    if c_val == c_val and a_val == a_val:  # NaN guards
+                        components[key] = c_val - a_val
+            except Exception as exc:
+                logger.warning("Per-term decomposition failed: %s", exc)
+
+        # Backwards-compatible alias: steric_confinement_kcal_mol now means
+        # vdw_strain specifically (the breaking-change scope agreed in the
+        # plan). Falls back to zero if decomposition unavailable.
+        components["steric_confinement_kcal_mol"] = components.get(
+            "vdw_strain", 0.0
         )
+        return raw_strain, components
 
-        components = {
-            "cyclic_energy": cyclic_energy,
-            "acyclic_energy": acyclic_energy,
-            "cyclic_energy_per_heavy": cyclic_result.energy_per_heavy_atom,
-            "acyclic_energy_per_heavy": acyclic_result.energy_per_heavy_atom,
-        }
-
-        return raw_strain, per_ring, components
-
-    # ------------------------------------------------------------------
-    # Reference construction
-    # ------------------------------------------------------------------
-
-    def _build_acyclic_reference(
+    def _compute_acyclic_energy_with_mol(
         self,
         mol: Mol,
-        ring_info: RingSystemInfo,
-    ) -> Tuple[Mol, List[int]]:
-        """Build an acyclic analog of the cyclic molecule.
+        ring_info: RingInfo,
+        use_boltzmann: bool = True,
+    ) -> Tuple[Mol, float]:
+        """Compute the acyclic reference energy, with optional Boltzmann averaging.
 
-        Strategy for monocyclic: break one ring bond, cap with H.
-        For polycyclic: break all rings sequentially, cap with H.
+        Tries opening the ring at **every** single ring bond, optimises each
+        resulting acyclic reference, and retains the one with the lowest
+        energy (most stable open form).  This removes any bias from picking
+        a single "best" bond and guarantees the strain is measured against
+        the most favourable ring-opening pathway.
 
-        Returns (acyclic_mol, list_of_broken_bond_indices).
+        Returns both the best acyclic molecule (with its conformers) and
+        its energy.
         """
-        rw_mol = RWMol(mol)
-        broken_bonds = []
+        # Build and evaluate all possible ring openings
+        candidates = self._build_all_acyclic_references(Chem.Mol(mol), ring_info)
+        best_mol = None
+        best_energy = float("inf")
 
-        for ring in ring_info.rings:
-            # Find a non-aromatic ring bond to break
-            bond_idx = self._choose_bond_to_break(rw_mol, ring)
-            if bond_idx is None:
+        for acyclic_raw, _broken_bond in candidates:
+            try:
+                acyclic_result = self.mmff.embed_and_optimize(acyclic_raw)
+                acyclic_with_H = acyclic_result.molecule
+                acyclic_energy = acyclic_result.total_energy
+
+                # Acyclic torsion-diversity seeds: random-coords ETKDG hits
+                # both extended (anti) and gauche rotamer families for the
+                # chain backbone. Without this, the lowest-energy acyclic
+                # geometry can be biased by whatever rotamer family ETKDG
+                # happens to seed — which inflates `cyclic_E - acyclic_E`
+                # for bulky substituted rings.
+                try:
+                    self.mmff.seed_random_coords_conformers(
+                        acyclic_with_H, n_seeds=20, seed_offset=3000,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Acyclic random-coords seeding failed: %s", exc,
+                    )
+
+                # Symmetric bulk-aware scaling on the acyclic side: matches
+                # the cyclic-side search depth so neither pool gets a sampling
+                # advantage that would bias `cyclic_E - acyclic_E`.
+                bulk = self.mmff.compute_bulk_score(acyclic_with_H)
+                pt_steps_eff = 150 + 30 * bulk
+                mc_steps_eff = 200 + 40 * bulk
+                pt_temps_eff = (
+                    (300.0, 500.0, 800.0, 1200.0, 2000.0)
+                    if bulk >= 12
+                    else (300.0, 500.0, 1000.0, 2000.0)
+                )
+
+                # Monte Carlo / PT torsion search
+                try:
+                    mc_energy = acyclic_energy
+                    pt_id, pt_energy = self.mmff.parallel_tempering_search(
+                        acyclic_with_H,
+                        n_steps=pt_steps_eff,
+                        temperatures=pt_temps_eff,
+                    )
+                    if pt_id >= 0 and pt_energy < mc_energy:
+                        mc_energy = pt_energy
+                    else:
+                        mc_id, mc_e = self.mmff.monte_carlo_search(
+                            acyclic_with_H, n_steps=mc_steps_eff,
+                        )
+                        if mc_id >= 0 and mc_e < mc_energy:
+                            mc_energy = mc_e
+                except Exception as exc:
+                    logger.warning("Acyclic MC/PT search failed: %s", exc)
+
+                if use_boltzmann:
+                    try:
+                        kept = self.mmff.cluster_conformers(
+                            acyclic_with_H,
+                            rmsd_threshold=0.5,
+                            energy_window_kcal=8.0,
+                        )
+                        if len(kept) >= 2:
+                            keep_confs = [
+                                Chem.Conformer(acyclic_with_H.GetConformer(c))
+                                for c in kept
+                            ]
+                            acyclic_with_H.RemoveAllConformers()
+                            for c in keep_confs:
+                                acyclic_with_H.AddConformer(c, assignId=True)
+                        boltz_e = self.mmff.compute_boltzmann_energy(
+                            acyclic_with_H, temperature=298.15,
+                        )
+                        if not (boltz_e != boltz_e):  # nan check
+                            acyclic_energy = boltz_e
+                    except Exception as exc:
+                        logger.warning(
+                            "Acyclic Boltzmann averaging failed: %s", exc,
+                        )
+
+                if acyclic_energy < best_energy:
+                    best_energy = acyclic_energy
+                    best_mol = acyclic_with_H
+            except Exception as exc:
+                logger.warning(
+                    "Acyclic reference for bond %s failed: %s",
+                    _broken_bond, exc,
+                )
                 continue
 
-            bond = rw_mol.GetBondWithIdx(bond_idx)
-            a1 = bond.GetBeginAtomIdx()
-            a2 = bond.GetEndAtomIdx()
+        if best_mol is None:
+            raise RuntimeError(
+                "Failed to build any valid acyclic reference for ring size %d"
+                % ring_info.size,
+            )
 
-            # Remove the bond
-            was_aromatic = bond.GetIsAromatic()
-            rw_mol.RemoveBond(a1, a2)
-            broken_bonds.append(bond_idx)
+        return best_mol, best_energy
 
-            # If we broke an aromatic bond, clear aromatic flags
-            # on affected atoms so sanitization does not reject them
-            for aidx in (a1, a2):
-                atom = rw_mol.GetAtomWithIdx(aidx)
-                if was_aromatic:
-                    atom.SetIsAromatic(False)
+    def _build_all_acyclic_references(
+        self,
+        mol: Mol,
+        ring_info: RingInfo,
+    ) -> List[Tuple[Mol, int]]:
+        """Build an acyclic reference for **every** single ring bond.
 
-        # Let RDKit compute correct implicit H counts via sanitization
-        # (avoids the SetNumExplicitHs / GetTotalNumHs double-counting bug
-        #  where implicit H persist after setting explicit H)
-        try:
-            Chem.SanitizeMol(rw_mol)
-        except Exception as exc:
-            logger.warning("Acyclic reference sanitization: %s", exc)
+        Returns a list of ``(acyclic_mol, broken_bond_idx)`` tuples, one per
+        breakable single bond in the ring.  Callers can then optimise each
+        and pick the lowest-energy representative.
+        """
+        results: List[Tuple[Mol, int]] = []
+        ring_atom_set = set(ring_info.atom_indices)
 
-        return rw_mol.GetMol(), broken_bonds
+        for bidx in ring_info.bond_indices:
+            rw_mol = RWMol(mol)
+            bond = rw_mol.GetBondWithIdx(bidx)
+            if bond is None or bond.GetBondType() != rdchem.BondType.SINGLE:
+                continue
+            # Verify both endpoints are in the ring (safety check)
+            if (bond.GetBeginAtomIdx() not in ring_atom_set
+                    or bond.GetEndAtomIdx() not in ring_atom_set):
+                continue
+
+            rw_mol.RemoveBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+            try:
+                Chem.SanitizeMol(rw_mol)
+            except Exception as exc:
+                logger.warning(
+                    "Sanitization failed for acyclic ref (bond %d): %s",
+                    bidx, exc,
+                )
+                continue
+            results.append((rw_mol.GetMol(), bidx))
+
+        if not results:
+            raise RuntimeError(
+                "No breakable single ring bond found for ring size %d"
+                % ring_info.size,
+            )
+        return results
 
     @staticmethod
-    def _choose_bond_to_break(rw_mol, ring: RingInfo) -> Optional[int]:
-        """Select the best ring bond to break.
+    def _choose_bond_to_break(rw_mol, ring_info: RingInfo) -> Optional[int]:
+        """Select the ring bond to break for ring opening.
 
-        Prefers single bonds, avoids aromatic bonds, and chooses the
-        bond that will minimize conformational strain in the open form.
+        Preference order:
+        1. Single bonds only.
+        2. Among single bonds, the one whose two endpoint ring atoms
+           carry the most off-ring heavy-atom substituents combined.
+           This places bulky substituents at opposite ends of the
+           opened chain.
         """
-        for bidx in ring.bond_indices:
-            bond = rw_mol.GetBondWithIdx(bidx)
-            if bond is not None and not bond.GetIsAromatic():
-                if bond.GetBondType() == rdchem.BondType.SINGLE:
-                    return bidx
+        ring_atom_set = set(ring_info.atom_indices)
 
-        # Fallback: any non-aromatic ring bond
-        for bidx in ring.bond_indices:
-            bond = rw_mol.GetBondWithIdx(bidx)
-            if bond is not None and not bond.GetIsAromatic():
-                return bidx
+        def substituent_count(atom_idx: int) -> int:
+            atom = rw_mol.GetAtomWithIdx(atom_idx)
+            return sum(
+                1 for nb in atom.GetNeighbors()
+                if nb.GetIdx() not in ring_atom_set
+            )
 
-        # Desperate fallback: any ring bond
-        return ring.bond_indices[0] if ring.bond_indices else None
+        best_idx = None
+        best_score = -1
+        for bidx in ring_info.bond_indices:
+            bond = rw_mol.GetBondWithIdx(bidx)
+            if bond is None or bond.GetBondType() != rdchem.BondType.SINGLE:
+                continue
+            score = (
+                substituent_count(bond.GetBeginAtomIdx())
+                + substituent_count(bond.GetEndAtomIdx())
+            )
+            if score > best_score:
+                best_score = score
+                best_idx = bidx
+
+        if best_idx is not None:
+            return best_idx
+        return ring_info.bond_indices[0] if ring_info.bond_indices else None
 
     # ------------------------------------------------------------------
-    # Homodesmotic reaction for cycloalkanes (high accuracy)
+    # Strict homodesmotic reaction for unsubstituted cycloalkanes
     # ------------------------------------------------------------------
 
     def build_cycloalkane_homodesmotic_reaction(
         self,
         ring_size: int,
     ) -> Optional[HomodesmoticReaction]:
-        """Build a strict homodesmotic reaction for cycloalkanes.
+        """Build the bond-balanced homodesmotic reaction.
 
         cyclo-(CH2)n + CH3-CH3  ->  CH3-(CH2)(n+1)-CH3
-
-        This is fully bond-balanced: both sides have the same count
-        of C-C(sp3-sp3), C-H bonds, and sp3 carbons.
         """
         if ring_size < 3:
             return None
 
-        # Build cyclic SMILES
         cyclic = "C1" + "C" * (ring_size - 2) + "C1"
-
-        # Build linear alkane: n+2 carbons
         linear = "C" + "C" * (ring_size + 1)
 
         return HomodesmoticReaction(
@@ -256,17 +397,11 @@ class HomodesmoticAnalyzer:
             ),
         )
 
-    def compute_cycloalkane_strain(
-        self,
-        ring_size: int,
-    ) -> Optional[float]:
-        """Compute raw homodesmotic strain for a cycloalkane using the
-        strict bond-balanced reaction scheme.
+    def compute_cycloalkane_strain(self, ring_size: int) -> Optional[float]:
+        """Compute raw homodesmotic strain for an unsubstituted cycloalkane.
 
-        Returns raw MMFF94 strain in kcal/mol.
-
-        Results are cached at module level — these are physical constants
-        for a given MMFF94 parameter set and ring size.
+        Uses the strict bond-balanced reaction scheme.
+        Results are cached at module level.
         """
         global _ETHANE_ENERGY, _CYCLOALKANE_STRAIN_CACHE
 
@@ -291,7 +426,6 @@ class HomodesmoticAnalyzer:
             linear_result = self.mmff.embed_and_optimize(linear_mol)
             linear_energy = linear_result.total_energy
 
-            # E_strain = E(cyclic) + E(ethane) - E(linear)
             strain = cyclic_energy + _ETHANE_ENERGY - linear_energy
             _CYCLOALKANE_STRAIN_CACHE[ring_size] = strain
             return strain
@@ -299,127 +433,26 @@ class HomodesmoticAnalyzer:
         except Exception as exc:
             logger.error(
                 "Cycloalkane homodesmotic strain failed for ring size %d: %s",
-                ring_size,
-                exc,
+                ring_size, exc,
             )
             return None
 
-    # ------------------------------------------------------------------
-    # Classification helpers
-    # ------------------------------------------------------------------
 
-    @staticmethod
-    def _is_simple_carbocycle(mol: Mol, ring_info: RingSystemInfo) -> bool:
-        """Check if molecule is a simple saturated monocyclic carbocycle
-        (no heteroatoms, no aromatics, single ring, all sp3 carbons,
-        no double/triple bonds anywhere).
+def _is_unsubstituted_cycloalkane(mol: Mol, ring_info: RingInfo) -> bool:
+    """Check if molecule is a pure cycloalkane (no substituents, no heteroatoms).
 
-        The strict bond-balanced cycloalkane shortcut models the ring as
-        a fully saturated cyclo-(CH2)n. It must NOT be used for unsaturated
-        rings (e.g. cyclohexene C1CCCC=C1) or rings bearing unsaturated
-        substituents, otherwise their strain would be computed as if they
-        were the corresponding saturated cycloalkane.
-        """
-        if ring_info.num_rings != 1:
+    All atoms must be carbon, all bonds must be single bonds, the ring
+    size must be <= 8, and the heavy-atom count must exactly equal the
+    ring size (no extra atoms beyond the ring).
+    """
+    if ring_info.size > 8:
+        return False
+    if mol.GetNumHeavyAtoms() != ring_info.size:
+        return False
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() != 6:
             return False
-        ring = ring_info.rings[0]
-        if ring.is_aromatic or ring.is_heterocyclic:
+    for bond in mol.GetBonds():
+        if bond.GetBondType() != rdchem.BondType.SINGLE:
             return False
-        if ring.size > 8:
-            return False
-        # Verify all atoms are carbon
-        for atom in mol.GetAtoms():
-            if atom.GetAtomicNum() != 6:
-                return False
-        # Verify the molecule is fully saturated: every bond must be a
-        # single bond. Any double/triple (or aromatic) bond means the
-        # saturated-cycloalkane model does not apply.
-        for bond in mol.GetBonds():
-            if bond.GetBondType() != rdchem.BondType.SINGLE:
-                return False
-        return True
-
-    @staticmethod
-    def _is_aromatic_system(ring_info: RingSystemInfo) -> bool:
-        """Check if ALL rings in the system are fully aromatic."""
-        if ring_info.num_rings == 0:
-            return False
-        return all(r.is_aromatic for r in ring_info.rings)
-
-    # ------------------------------------------------------------------
-    # Ring allocation
-    # ------------------------------------------------------------------
-
-    def _allocate_strain_to_rings(
-        self,
-        mol: Mol,
-        total_strain: float,
-        ring_info: RingSystemInfo,
-    ) -> Dict[int, float]:
-        """Attribute total strain to individual rings.
-
-        For isolated rings: strain is attributed by ring size proportion.
-        For fused/bridged/cage: strain is attributed based on ring size
-        and shared-atom count.
-
-        A ring that shares many atoms (fused/cage) gets less individual
-        attribution because its strain is distributed among the system.
-        """
-        if ring_info.num_rings == 1:
-            return {0: total_strain}
-
-        # Weight by ring size (smaller rings contribute more strain)
-        weights = {}
-        for ring in ring_info.rings:
-            # Smaller rings have higher strain per atom
-            size_weight = 1.0 / max(ring.size, 1)
-            # Rings sharing many atoms (cage) get slightly less weight
-            share_penalty = 1.0 / (1.0 + ring.shared_atoms_with_other_rings * 0.1)
-            weights[ring.ring_index] = size_weight * share_penalty
-
-        total_weight = sum(weights.values())
-        if total_weight == 0:
-            # Equal split
-            return {i: total_strain / ring_info.num_rings
-                    for i in range(ring_info.num_rings)}
-
-        return {
-            idx: total_strain * w / total_weight
-            for idx, w in weights.items()
-        }
-
-    def _fallback_strain(
-        self,
-        mol: Mol,
-        cyclic_result: MMFFResult,
-        ring_info: RingSystemInfo,
-    ) -> Tuple[float, Dict[int, float], Dict[str, float]]:
-        """Fallback strain estimation when acyclic reference fails.
-
-        Uses per-heavy-atom energy comparison with a reference n-alkane.
-        Less accurate but better than returning nothing.
-        """
-        n_heavy = cyclic_result.num_heavy_atoms
-        energy = cyclic_result.total_energy
-
-        # Estimate strain-free reference energy using linear alkane
-        # CH3-(CH2)(n-2)-CH3 has approximately (-4.9 * n) kcal/mol in MMFF94
-        # The slope varies, so we use actual computed values when possible.
-        rough_ref_energy_per_atom = -4.9
-        ref_energy = rough_ref_energy_per_atom * n_heavy
-
-        raw_strain = energy - ref_energy
-        raw_strain = max(raw_strain, 0.0)
-
-        per_ring = self._allocate_strain_to_rings(mol, raw_strain, ring_info)
-
-        components = {
-            "cyclic_energy": energy,
-            "acyclic_energy": ref_energy,
-            "cyclic_energy_per_heavy": cyclic_result.energy_per_heavy_atom,
-            "acyclic_energy_per_heavy": rough_ref_energy_per_atom,
-            "fallback": True,
-        }
-
-        logger.warning("Using fallback strain estimation (less accurate).")
-        return raw_strain, per_ring, components
+    return True

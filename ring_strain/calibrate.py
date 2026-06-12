@@ -24,9 +24,8 @@ logger = logging.getLogger(__name__)
 class StrainCalibrator:
     """Calibrate raw MMFF94 homodesmotic strain to experimental scale.
 
-    Computes per-ring-size correction factors from reference compounds,
-    applies them to arbitrary ring systems, and handles polycyclic
-    decomposition.
+    Computes per-ring-size correction factors from reference compounds
+    and applies them to monocyclic saturated carbocycles.
 
     Calibration factors are cached at class level — the reference data
     and MMFF94 force field are deterministic, so calibration needs to
@@ -40,7 +39,6 @@ class StrainCalibrator:
         For computing raw MMFF94 strain of reference compounds.
     """
 
-    # Class-level cache: calibration is deterministic, run once globally
     _factors_cache: Optional[Dict[int, float]] = None
     _interpolator_cache: Optional[interp1d] = None
 
@@ -52,25 +50,12 @@ class StrainCalibrator:
         self.ref_db = reference_db
         self.mmff = mmff_calc
         self.homo_analyzer = HomodesmoticAnalyzer(mmff_calc)
-
-        # Calibration factors: ring_size -> correction factor
         self._factors: Dict[int, float] = {}
         self._interpolator: Optional[interp1d] = None
         self._calibrated = False
 
-    # ------------------------------------------------------------------
-    # Build calibration
-    # ------------------------------------------------------------------
-
     def build_calibration(self) -> Dict[int, float]:
         """Compute per-ring-size calibration factors from reference data.
-
-        For each ring size in the reference database, computes the ratio
-        experimental_strain / raw_mmff_strain and stores the mean.
-
-        Results are cached at class level — the reference data and MMFF94
-        force field are deterministic, so calibration runs only once per
-        process regardless of how many StrainAnalyzer instances are created.
 
         Returns:
             {ring_size: correction_factor}
@@ -101,29 +86,13 @@ class StrainCalibrator:
 
         # Compute correction factor per ring size
         for size, pairs_list in size_values.items():
-            if size == 6:
-                # Cyclohexane is the reference zero — we know its raw MMFF
-                # homodesmotic strain should calibrate to ~0
-                raw_values = [p[0] for p in pairs_list]
-                exp_values = [p[1] for p in pairs_list]
-                # Use linear regression forced through ~0 intercept for size 6
-                if raw_values and exp_values:
-                    mean_raw = np.mean(raw_values)
-                    mean_exp = np.mean(exp_values)
-                    if mean_raw > 0.01:
-                        self._factors[size] = mean_exp / mean_raw
-                    else:
-                        self._factors[size] = 1.0
-                else:
-                    self._factors[size] = 1.0
+            raw_values = [p[0] for p in pairs_list]
+            exp_values = [p[1] for p in pairs_list]
+            if raw_values:
+                ratios = [e / max(r, 0.01) for e, r in zip(exp_values, raw_values)]
+                self._factors[size] = float(np.median(ratios))
             else:
-                raw_values = [p[0] for p in pairs_list]
-                exp_values = [p[1] for p in pairs_list]
-                if raw_values:
-                    ratios = [e / max(r, 0.01) for e, r in zip(exp_values, raw_values)]
-                    self._factors[size] = float(np.median(ratios))
-                else:
-                    self._factors[size] = 1.0
+                self._factors[size] = 1.0
 
         # Build interpolator for non-standard sizes
         if len(self._factors) >= 2:
@@ -138,29 +107,18 @@ class StrainCalibrator:
 
         self._calibrated = True
 
-        # Persist to class-level cache so future instances skip computation
+        # Persist to class-level cache
         StrainCalibrator._factors_cache = dict(self._factors)
         StrainCalibrator._interpolator_cache = self._interpolator
 
         return dict(self._factors)
 
-    # ------------------------------------------------------------------
-    # Apply calibration
-    # ------------------------------------------------------------------
-
-    def calibrate(
-        self,
-        raw_strain_mmff: float,
-        ring_sizes: List[int],
-    ) -> float:
+    def calibrate(self, raw_strain_mmff: float, ring_size: int) -> float:
         """Convert raw MMFF94 strain to calibrated experimental scale.
-
-        For mono-sized systems: apply ring-size-specific factor.
-        For mixed-size systems: apply weighted average factor.
 
         Args:
             raw_strain_mmff: Raw homodesmotic strain from MMFF94 (kcal/mol).
-            ring_sizes: List of ring sizes present in the system.
+            ring_size: Ring size for correction factor lookup.
 
         Returns:
             Calibrated strain energy in kcal/mol (experimental scale).
@@ -168,53 +126,12 @@ class StrainCalibrator:
         if not self._calibrated:
             self.build_calibration()
 
-        if not ring_sizes:
-            return max(raw_strain_mmff, 0.0)
-
-        # Get correction factor (weighted average by 1/ring_size,
-        # since smaller rings drive most of the strain)
-        weights = [1.0 / max(s, 1) for s in ring_sizes]
-        total_w = sum(weights)
-
-        factor = 0.0
-        for size, w in zip(ring_sizes, weights):
-            f = self.get_correction_factor(size)
-            factor += f * w
-
-        factor /= total_w
-
+        factor = self.get_correction_factor(ring_size)
         calibrated = raw_strain_mmff * factor
         return max(calibrated, 0.0)
 
-    def calibrate_per_ring(
-        self,
-        raw_per_ring: Dict[int, float],
-        ring_sizes: Dict[int, int],
-    ) -> Dict[int, float]:
-        """Apply ring-size-specific calibration to individual rings.
-
-        Args:
-            raw_per_ring: ring_index -> raw MMFF strain.
-            ring_sizes: ring_index -> ring size.
-
-        Returns:
-            ring_index -> calibrated strain (kcal/mol).
-        """
-        if not self._calibrated:
-            self.build_calibration()
-
-        calibrated = {}
-        for idx, raw_strain in raw_per_ring.items():
-            size = ring_sizes.get(idx, 6)
-            factor = self.get_correction_factor(size)
-            calibrated[idx] = max(raw_strain * factor, 0.0)
-        return calibrated
-
     def get_correction_factor(self, ring_size: int) -> float:
-        """Get the calibration factor for a specific ring size.
-
-        Uses interpolation for sizes not in the reference set.
-        """
+        """Get the calibration factor for a specific ring size."""
         if not self._calibrated:
             self.build_calibration()
 
@@ -224,34 +141,22 @@ class StrainCalibrator:
         if self._interpolator is not None:
             return float(self._interpolator(ring_size))
 
-        # Fallback: use size 6 factor as default
         return self._factors.get(6, 1.0)
 
-    def estimate_uncertainty(self, ring_sizes: List[int]) -> float:
-        """Estimate calibration uncertainty based on ring composition.
-
-        Returns estimated uncertainty in kcal/mol.
-        """
+    def estimate_uncertainty(self, ring_size: int) -> float:
+        """Estimate calibration uncertainty for a given ring size (kcal/mol)."""
         if not self._calibrated:
             self.build_calibration()
 
-        # More uncertainty for exotic ring sizes and mixed systems
-        uncertainty = 1.0  # Base uncertainty
+        uncertainty = 1.0
+        if ring_size not in self._factors:
+            uncertainty += 2.0
+        elif ring_size <= 4:
+            uncertainty += 1.5
+        elif ring_size >= 9:
+            uncertainty += 1.0
 
-        for size in ring_sizes:
-            if size not in self._factors:
-                uncertainty += 2.0  # No reference data for this size
-            elif size <= 4:
-                uncertainty += 1.5  # MMFF94 is less accurate for small rings
-            elif size >= 9:
-                uncertainty += 1.0  # Medium/large rings have less reference data
-
-        uncertainty = min(uncertainty, 5.0)
-        return uncertainty
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
+        return min(uncertainty, 5.0)
 
     def _compute_raw_strain_for_ref(
         self,
@@ -260,26 +165,16 @@ class StrainCalibrator:
     ) -> Optional[float]:
         """Compute raw MMFF94 homodesmotic strain for a reference compound."""
         from rdkit import Chem
-        from .ring_analysis import RingAnalyzer
 
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             return None
 
-        # For simple cycloalkanes, use the strict homodesmotic method
-        if (
-            ref.ring_count == 1
-            and not any(c not in "C" for c in smiles if c.isalpha())
-            and len(ref.ring_sizes) == 1
-            and ref.ring_sizes[0] <= 8
-        ):
+        # All calibration references are simple cycloalkanes - use strict method
+        if ref.ring_sizes and ref.ring_sizes[0] <= 8:
             return self.homo_analyzer.compute_cycloalkane_strain(ref.ring_sizes[0])
 
-        # For other compounds, use the generic ring-opening method
-        analyzer = RingAnalyzer(mol)
-        ring_info = analyzer.identify_all_rings()
-        raw_strain, _, _ = self.homo_analyzer.compute_total_strain(mol, ring_info)
-        return raw_strain
+        return None
 
     @property
     def factors(self) -> Dict[int, float]:

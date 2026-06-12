@@ -3,7 +3,6 @@ Command-line interface for ring strain analysis.
 
 Usage:
     python -m cli.main "C1CC1"                     # cyclopropane
-    python -m cli.main "C1CC1" --verbose           # detailed output
     python -m cli.main "C1CC1" --json              # JSON output
     python -m cli.main "C1CC1" --compare-ref       # compare with ref
     python -m cli.main --batch compounds.csv       # batch mode
@@ -30,7 +29,7 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog="""
 Examples:
   %(prog)s "C1CC1"              Analyze cyclopropane
-  %(prog)s "c1ccccc1"           Analyze benzene
+  %(prog)s "C1CCCC1"            Analyze cyclopentane
   %(prog)s "C1CC1" --json       Output as JSON
   %(prog)s "C1CC1" --compare-ref Compare with experimental data
   %(prog)s --list-refs           List all reference compounds
@@ -40,17 +39,12 @@ Examples:
     parser.add_argument(
         "smiles",
         nargs="?",
-        help="SMILES string to analyze",
+        help="SMILES string to analyze (monocyclic saturated carbocycles only)",
     )
     parser.add_argument(
         "--json", "-j",
         action="store_true",
         help="Output results as JSON.",
-    )
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Show detailed per-ring breakdown.",
     )
     parser.add_argument(
         "--compare-ref", "-c",
@@ -74,6 +68,17 @@ Examples:
         type=int,
         default=42,
         help="Random seed for conformer generation (default: 42).",
+    )
+    parser.add_argument(
+        "--no-monte-carlo",
+        action="store_true",
+        help="Disable Monte Carlo search for substituted cycloalkanes.",
+    )
+    parser.add_argument(
+        "--mc-steps",
+        type=int,
+        default=500,
+        help="Monte Carlo steps (default: 500).",
     )
     parser.add_argument(
         "--batch",
@@ -103,6 +108,8 @@ def main():
         n_conformers=args.n_conformers,
         random_seed=args.seed,
         stability_threshold=args.threshold,
+        use_monte_carlo=not args.no_monte_carlo,
+        mc_steps=args.mc_steps,
     )
 
     # --- List references ---
@@ -132,7 +139,7 @@ def main():
     else:
         print(report.print_summary())
 
-        if args.compare_ref:
+        if args.compare_ref and report.is_supported:
             ref = analyzer.ref_db.get_by_smiles(args.smiles)
             if ref:
                 print(f"\n--- Known Reference ---")
@@ -145,15 +152,6 @@ def main():
             else:
                 print(f"\n  (No experimental reference found for this SMILES)")
 
-        if args.verbose and report.per_ring_details:
-            print(f"\n--- Geometric Details ---")
-            for ring in report.per_ring_details:
-                print(f"  Ring {ring['ring_index']} ({ring['size']}-membered, {ring['type']}):")
-                print(f"    Atoms: {ring['atoms']}")
-                if ring['heteroatoms']:
-                    print(f"    Heteroatoms: {ring['heteroatoms']}")
-                print(f"    Aromatic: {ring['is_aromatic']}")
-
 
 # -----------------------------------------------------------------------
 # Command implementations
@@ -163,11 +161,11 @@ def _cmd_list_refs(analyzer: StrainAnalyzer):
     refs = analyzer.list_references()
     print(f"\nReference Compounds ({len(refs)} total)")
     print("=" * 70)
-    print(f"{'Name':<28} {'SMILES':<20} {'Strain':>8} {'Ring Sizes':>12}")
+    print(f"{'Name':<38} {'SMILES':<20} {'Strain':>8} {'Ring Sizes':>12}")
     print("-" * 70)
     for r in refs:
         print(
-            f"{r['name']:<28} {r['smiles']:<20} "
+            f"{r['name']:<38} {r['smiles']:<20} "
             f"{r['strain_kcal_mol']:>7.1f}  {str(r['ring_sizes']):>12}"
         )
 
@@ -177,21 +175,23 @@ def _cmd_benchmark(analyzer: StrainAnalyzer):
     results = []
 
     print(f"\nBenchmark: {len(refs)} reference compounds")
-    print("=" * 75)
-    print(f"{'Name':<28} {'Exp':>7} {'MMFF':>7} {'Calib':>7} {'Error':>6}")
+    print("=" * 80)
+    print(f"{'Name':<38} {'Exp':>7} {'MMFF':>7} {'Calib':>7} {'Error':>6} {'Note'}")
 
     errors = []
     for ref in refs:
         try:
             report = analyzer.analyze(ref.smiles)
             error = abs(report.total_strain_calibrated_kcal_mol - ref.strain_energy_kcal_mol)
-            errors.append(error)
+            if report.is_supported:
+                errors.append(error)
+            note = "" if report.is_supported else "skipped"
             print(
-                f"{ref.name:<28} "
+                f"{ref.name:<38} "
                 f"{ref.strain_energy_kcal_mol:>6.1f} "
                 f"{report.total_strain_mmff_kcal_mol:>6.1f} "
                 f"{report.total_strain_calibrated_kcal_mol:>6.1f} "
-                f"{error:>5.2f}"
+                f"{error:>5.2f}  {note}"
             )
             results.append({
                 "name": ref.name,
@@ -200,12 +200,13 @@ def _cmd_benchmark(analyzer: StrainAnalyzer):
                 "mmff_raw": report.total_strain_mmff_kcal_mol,
                 "calibrated": report.total_strain_calibrated_kcal_mol,
                 "error": error,
+                "supported": report.is_supported,
             })
         except Exception as exc:
-            print(f"{ref.name:<28} {'FAILED':>7} ({exc})")
+            print(f"{ref.name:<38} {'FAILED':>7} ({exc})")
 
     if errors:
-        print("-" * 75)
+        print("-" * 80)
         print(f"  Mean absolute error: {sum(errors)/len(errors):.2f} kcal/mol")
         print(f"  Max  absolute error: {max(errors):.2f} kcal/mol")
         print(f"  N compounds:         {len(errors)}")

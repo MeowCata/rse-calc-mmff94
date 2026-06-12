@@ -9,12 +9,11 @@ Computes individual strain components:
 Provides qualitative decomposition of where ring strain originates.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 from rdkit import Chem
 from rdkit.Chem.rdchem import Mol
-from rdkit.Geometry import Point3D
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(python -m examples.basic_usage)",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, ''.''\\); from mmff94.ring_strain.core import StrainAnalyzer; a = StrainAnalyzer\\(\\); r = a.analyze\\(''C1CC1''\\); print\\(f''Strain: {r.total_strain_calibrated_kcal_mol:.1f}, Score: {r.stability_score:.1f}''\\)\")",
+      "Bash(python -c \"import sys; print\\(''\\\\n''.join\\(sys.path\\)\\)\")",
+      "Read(//c/Users/miaoc/Desktop/**)",
+      "Bash(python -c \"from mmff94.ring_strain.core import StrainAnalyzer; a = StrainAnalyzer\\(\\); r = a.analyze\\(''C1CC1''\\); print\\(f''Strain: {r.total_strain_calibrated_kcal_mol:.1f}, Score: {r.stability_score:.1f}''\\)\")",
+      "Bash(python -m mmff94.examples.basic_usage)",
+      "Bash(python -m cli.main \"C1CCCC=C1\")",
+      "Bash(python -m cli.main \"C1CCCCC1\")",
+      "Bash(python -m cli.main C1=CC1)",
+      "Bash(python -m cli.main C1CC1)",
+      "Bash(python -m pytest tests/ -q)",
+      "Bash(python -c \"import rdkit; print\\(''rdkit'', rdkit.__version__\\)\")",
+      "Bash(python -c \"import os; print\\(''cpus'', os.cpu_count\\(\\)\\)\")",
+      "Bash(python:*)"
+    ]
+  }
+}

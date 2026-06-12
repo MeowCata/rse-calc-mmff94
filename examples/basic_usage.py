@@ -3,16 +3,16 @@ Example usage of the ring strain analysis system.
 
 Demonstrates:
 - Basic single-molecule analysis
-- Batch processing
+- Cycloalkane series
+- Substituted cycloalkanes (steric effects)
 - Comparing molecules
-- Listing reference compounds
+- Handling "Not Supported" inputs
 """
 
 from mmff94.ring_strain.core import StrainAnalyzer
 
 
 def main():
-    # Initialize analyzer (uses default settings)
     analyzer = StrainAnalyzer()
 
     # Example 1: Single molecule analysis
@@ -23,7 +23,7 @@ def main():
     print(report)
     print()
 
-    # Example 2: Compare cycloalkanes
+    # Example 2: Cycloalkane series
     print("=" * 60)
     print("Example 2: Cycloalkane Series")
     print("=" * 60)
@@ -46,46 +46,47 @@ def main():
         )
     print()
 
-    # Example 3: Aromatic and heterocyclic
+    # Example 3: Substituted cycloalkanes (steric effects)
     print("=" * 60)
-    print("Example 3: Aromatic & Heterocyclic Rings")
+    print("Example 3: Steric Hindrance Effects")
     print("=" * 60)
-    aromatics = [
-        "c1ccccc1",     # benzene
-        "c1ccncc1",     # pyridine
-        "c1ccc2ccccc2c1",  # naphthalene
-        "C1CCOC1",      # tetrahydrofuran
+    substituted = [
+        ("C1CC1", "cyclopropane (unsubstituted)"),
+        ("CC1CC1C", "1,2-dimethylcyclopropane"),
+        ("CC(C)(C)C1CC1C(C)(C)C", "1,2-di-tert-butylcyclopropane"),
     ]
-    for smi in aromatics:
-        r = analyzer.analyze(smi)
-        print(
-            f"  {r.canonical_smiles:<30}  "
-            f"rings={r.num_rings}, "
-            f"strain={r.total_strain_calibrated_kcal_mol:+.2f}, "
-            f"score={r.stability_score:.1f} ({r.stability_category})"
-        )
-    print()
-
-    # Example 4: Polycyclic compounds
-    print("=" * 60)
-    print("Example 4: Polycyclic Compounds")
-    print("=" * 60)
-    polycyclics = [
-        ("C1CC2CCC1C2", "norbornane"),
-        ("C1C2CC3CC1CC(C2)C3", "adamantane"),
-        ("C1CCC2CCCCC2C1", "trans-decalin"),
-    ]
-    for smi, name in polycyclics:
+    for smi, name in substituted:
         try:
             r = analyzer.analyze(smi)
+            sub_str = " (substituted)" if r.is_substituted else ""
+            mc_str = " [MC]" if r.monte_carlo_used else ""
             print(
-                f"  {name:<18}  "
-                f"{r.ring_system_type:<30}  "
-                f"strain={r.total_strain_calibrated_kcal_mol:.1f}, "
-                f"score={r.stability_score:.1f}"
+                f"  {name:<40} "
+                f"strain={r.total_strain_calibrated_kcal_mol:>5.1f}, "
+                f"score={r.stability_score:>5.1f}"
+                f"{sub_str}{mc_str}"
             )
         except Exception as exc:
-            print(f"  {name:<18}  FAILED: {exc}")
+            print(f"  {name:<40} FAILED: {exc}")
+    print()
+
+    # Example 4: "Not Supported" inputs
+    print("=" * 60)
+    print("Example 4: Not Supported Inputs")
+    print("=" * 60)
+    unsupported = [
+        ("c1ccccc1", "benzene (aromatic)"),
+        ("C1CC2CCC1C2", "norbornane (polycyclic)"),
+        ("C1=CCCCC1", "cyclohexene (unsaturated)"),
+        ("C1CCOC1", "THF (heterocyclic)"),
+    ]
+    for smi, name in unsupported:
+        r = analyzer.analyze(smi)
+        print(
+            f"  {name:<35}  "
+            f"supported={r.is_supported}, "
+            f"message='{r.validation_message}'"
+        )
     print()
 
     # Example 5: Compare two molecules
@@ -101,8 +102,8 @@ def main():
     print("Example 6: Acyclic molecule (n-hexane)")
     print("=" * 60)
     r = analyzer.analyze("CCCCCC")
-    print(f"  Category: {r.stability_category}")
-    print(f"  Strain:   {r.total_strain_calibrated_kcal_mol} kcal/mol")
+    print(f"  Supported: {r.is_supported}")
+    print(f"  Message:   {r.validation_message}")
     print()
 
 

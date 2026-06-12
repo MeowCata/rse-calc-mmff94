@@ -3,10 +3,14 @@ Main orchestrator for ring strain energy quantification.
 
 Provides the primary user-facing API (StrainAnalyzer.analyze()) and
 the StrainReport dataclass that holds all computation results.
+
+Only monocyclic saturated carbocycles are supported. Polycyclic, bridged,
+spiro, heterocyclic, aromatic, and unsaturated systems are rejected with
+a "Not Supported" message.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple  # noqa: F401
 
 from rdkit import Chem
 from rdkit.Chem.rdchem import Mol
@@ -15,11 +19,12 @@ from rdkit.Chem.rdMolDescriptors import CalcMolFormula
 from rdkit import RDLogger
 
 from .mmff import MMFFCalculator
-from .ring_analysis import RingAnalyzer, RingSystemInfo
+from .ring_analysis import RingAnalyzer, RingInfo
 from .reference import ReferenceCompound, ReferenceDatabase
 from .homodesmotic import HomodesmoticAnalyzer
 from .calibrate import StrainCalibrator
 from .scoring import StabilityScorer
+from .geometry import GeometryAnalyzer
 
 import logging
 
@@ -29,13 +34,25 @@ logger = logging.getLogger(__name__)
 RDLogger.logger().setLevel(RDLogger.ERROR)
 
 
+def _round_or_none(value: Optional[float], digits: int = 3) -> Optional[float]:
+    """Round a float for report output, propagating None and NaN as None."""
+    if value is None:
+        return None
+    try:
+        if value != value:  # NaN
+            return None
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Strain report
 # ---------------------------------------------------------------------------
 
 @dataclass
 class StrainReport:
-    """Complete ring strain analysis result for a molecule."""
+    """Complete ring strain analysis result for a monocyclic saturated carbocycle."""
 
     # Input
     smiles: str
@@ -44,10 +61,9 @@ class StrainReport:
     molecular_weight: float
     num_heavy_atoms: int
 
-    # Ring system overview
-    num_rings: int
-    ring_system_type: str
-    ring_sizes: List[int]
+    # Ring info
+    ring_size: int
+    is_substituted: bool
 
     # Strain energies (kcal/mol)
     total_strain_mmff_kcal_mol: float
@@ -58,25 +74,55 @@ class StrainReport:
     # Stability score
     stability_score: float
     stability_category: str
-    per_ring_scores: Dict[int, float]
 
-    # MMFF94 diagnostics (required, no defaults)
+    # MMFF94 diagnostics
     mmff_coverage: float
     optimization_converged: bool
     conformers_sampled: int
+    monte_carlo_used: bool
 
-    # Per-ring details (defaulted)
-    per_ring_details: List[Dict] = field(default_factory=list)
-
-    # Comparison with known reference (if available, defaulted)
+    # Comparison with known reference (if available)
     reference_match: Optional[Dict] = None
 
-    # Methodology info (defaulted)
+    # Methodology
     method: str = "MMFF94 homodesmotic + calibration"
     threshold_kcal_mol: float = 8.0
 
-    # Errors/warnings (defaulted)
+    # Validation
+    is_supported: bool = True
+    validation_message: str = ""
+
+    # Warnings
     warnings: List[str] = field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Geometry breakdown (Baeyer, Pitzer, transannular)
+    # ------------------------------------------------------------------
+    geometry_breakdown: Optional[Dict] = None
+    baeyer_strain_rms_deg: Optional[float] = None
+    pitzer_n_eclipsed: Optional[int] = None
+    transannular_contacts: Optional[List[Dict]] = None
+    steric_confinement_kcal_mol: Optional[float] = None
+
+    # ------------------------------------------------------------------
+    # MMFF94 per-term energy decomposition (cyclic - acyclic).
+    # vdW is the physically meaningful "true steric" strain; torsion is
+    # Pitzer-like; angle is Baeyer-like; bond is stretch. Diagnostic
+    # snapshots — not guaranteed to sum to total_strain_mmff_kcal_mol when
+    # Boltzmann averaging is in effect.
+    # ------------------------------------------------------------------
+    vdw_strain_kcal_mol: Optional[float] = None
+    torsion_strain_kcal_mol: Optional[float] = None
+    angle_strain_kcal_mol: Optional[float] = None
+    bond_strain_kcal_mol: Optional[float] = None
+
+    # Stereochemistry: if the input SMILES had unassigned ring stereocenters
+    # whose configuration affects strain (e.g. 1,3-di-tert-butyl-cyclohexane
+    # cis vs trans), all diastereomers are analyzed and the (min, max) of
+    # calibrated strain across them is recorded here. `None` when stereo
+    # was fully specified or only one isomer exists.
+    strain_range_kcal_mol: Optional[Tuple[float, float]] = None
+    stereoisomers_analyzed: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Serialization
@@ -100,28 +146,25 @@ class StrainReport:
             f"  Formula:           {self.formula}",
             f"  Molecular weight:  {self.molecular_weight:.2f} g/mol",
             f"  Heavy atoms:       {self.num_heavy_atoms}",
-            f"  Number of rings:   {self.num_rings}",
-            f"  Ring system type:  {self.ring_system_type}",
-            f"  Ring sizes:        {self.ring_sizes}",
-            "",
-            f"  Raw MMFF94 strain:       {self.total_strain_mmff_kcal_mol:+.2f} kcal/mol",
-            f"  Calibrated strain:       {self.total_strain_calibrated_kcal_mol:+.2f} kcal/mol",
-            f"  Strain per heavy atom:   {self.strain_per_heavy_atom_kcal_mol:+.3f} kcal/mol",
-            f"  Uncertainty:             +/- {self.calibration_uncertainty:.1f} kcal/mol",
-            "",
-            f"  Strain score:      {self.stability_score:.1f} / 100  ({self.stability_category})",
+            f"  Ring size:         {self.ring_size}-membered",
         ]
 
-        if self.per_ring_details:
+        if not self.is_supported:
             lines.append("")
-            lines.append("  Per-ring breakdown:")
-            lines.append("  " + "-" * 40)
-            for ring in self.per_ring_details:
-                lines.append(
-                    f"    Ring {ring['ring_index']} ({ring['size']}-membered {ring['type']}): "
-                    f"{ring['strain_calibrated']:+.2f} kcal/mol, "
-                    f"score={ring['score']:.1f}"
-                )
+            lines.append(f"  NOT SUPPORTED: {self.validation_message}")
+            lines.append("=" * 60)
+            return "\n".join(lines)
+
+        sub_str = " (substituted)" if self.is_substituted else ""
+        lines.append(f"  Ring type:          monocyclic saturated carbocycle{sub_str}")
+        lines.append(f"  Monte Carlo search: {'yes' if self.monte_carlo_used else 'no'}")
+        lines.append("")
+        lines.append(f"  Raw MMFF94 strain:       {self.total_strain_mmff_kcal_mol:+.2f} kcal/mol")
+        lines.append(f"  Calibrated strain:       {self.total_strain_calibrated_kcal_mol:+.2f} kcal/mol")
+        lines.append(f"  Strain per heavy atom:   {self.strain_per_heavy_atom_kcal_mol:+.3f} kcal/mol")
+        lines.append(f"  Uncertainty:             +/- {self.calibration_uncertainty:.1f} kcal/mol")
+        lines.append("")
+        lines.append(f"  Strain score:      {self.stability_score:.1f} / 100  ({self.stability_category})")
 
         if self.reference_match:
             lines.append("")
@@ -137,6 +180,50 @@ class StrainReport:
             lines.append("")
             for w in self.warnings:
                 lines.append(f"  WARNING: {w}")
+
+        if self.geometry_breakdown is not None:
+            lines.append("")
+            lines.append("  --- Geometry Decomposition ---")
+            if self.baeyer_strain_rms_deg is not None:
+                lines.append(
+                    f"  Baeyer (angle) RMS:     {self.baeyer_strain_rms_deg:.1f} deg"
+                )
+            if self.pitzer_n_eclipsed is not None:
+                lines.append(
+                    f"  Pitzer (torsion) eclipsed: {self.pitzer_n_eclipsed}"
+                )
+            if self.steric_confinement_kcal_mol is not None:
+                lines.append(
+                    f"  Steric confinement:     {self.steric_confinement_kcal_mol:+.2f} kcal/mol"
+                )
+            if self.transannular_contacts:
+                lines.append(
+                    f"  Transannular contacts:  {len(self.transannular_contacts)}"
+                )
+
+        # MMFF94 per-term decomposition of cyclic - acyclic energies.
+        decomp_fields = (
+            ("vdw_strain_kcal_mol",     "vdW (true steric):    "),
+            ("torsion_strain_kcal_mol", "Torsion (Pitzer):     "),
+            ("angle_strain_kcal_mol",   "Angle (Baeyer):       "),
+            ("bond_strain_kcal_mol",    "Bond stretch:         "),
+        )
+        if any(getattr(self, f) is not None for f, _ in decomp_fields):
+            lines.append("")
+            lines.append("  --- MMFF94 Energy Decomposition (cyclic - acyclic) ---")
+            for field_name, label in decomp_fields:
+                val = getattr(self, field_name)
+                if val is not None:
+                    lines.append(f"  {label} {val:+.2f} kcal/mol")
+
+        if self.strain_range_kcal_mol is not None:
+            lo, hi = self.strain_range_kcal_mol
+            n = self.stereoisomers_analyzed or 0
+            lines.append("")
+            lines.append(
+                f"  Stereochemistry unspecified — cis/trans range across "
+                f"{n} diastereomers: {lo:+.2f} to {hi:+.2f} kcal/mol"
+            )
 
         lines.append("=" * 60)
         return "\n".join(lines)
@@ -158,16 +245,22 @@ class StrainAnalyzer:
         report = analyzer.analyze("C1CC1")  # cyclopropane
         print(report)
 
+    Only monocyclic saturated carbocycles are supported. Polycyclic,
+    heterocyclic, aromatic, and unsaturated inputs return a report
+    with ``is_supported=False``.
+
     Parameters
     ----------
     n_conformers : int
         Number of conformers for MMFF94 global minimum search. Default 200.
-        Increase for flexible molecules, decrease for rigid rings.
     random_seed : int
         Seed for reproducible conformer generation.
     stability_threshold : float
         Threshold for stability score calculation (kcal/mol). Default 8.0.
-        Lower = more discriminating for strained compounds.
+    use_monte_carlo : bool
+        Use Monte Carlo torsion search for substituted cycloalkanes.
+    mc_steps : int
+        Number of Monte Carlo steps (default 500).
     """
 
     def __init__(
@@ -175,6 +268,10 @@ class StrainAnalyzer:
         n_conformers: int = 200,
         random_seed: int = 42,
         stability_threshold: float = 8.0,
+        use_monte_carlo: bool = True,
+        mc_steps: int = 500,
+        use_parallel_tempering: bool = True,
+        use_boltzmann: bool = True,
     ):
         self.mmff_calc = MMFFCalculator(
             n_conformers=n_conformers,
@@ -184,31 +281,34 @@ class StrainAnalyzer:
         self.calibrator = StrainCalibrator(self.ref_db, self.mmff_calc)
         self.scorer = StabilityScorer(threshold_kcal_mol=stability_threshold)
         self.homo_analyzer = HomodesmoticAnalyzer(self.mmff_calc)
+        self.use_monte_carlo = use_monte_carlo
+        self.mc_steps = mc_steps
+        self.use_parallel_tempering = use_parallel_tempering
+        self.use_boltzmann = use_boltzmann
 
     # ------------------------------------------------------------------
     # Main API
     # ------------------------------------------------------------------
 
     def analyze(self, smiles: str) -> StrainReport:
-        """Analyze ring strain for a molecule given its SMILES.
+        """Analyze ring strain for a monocyclic saturated carbocycle.
 
-        Full pipeline:
-        1. Parse SMILES and validate
-        2. Detect and classify all rings
-        3. Compute raw MMFF94 homodesmotic strain
-        4. Calibrate to experimental scale
-        5. Compute stability scores
-        6. Compare with reference data if available
+        Pipeline:
+        1. Parse SMILES and validate ring system
+        2. Compute raw MMFF94 homodesmotic strain
+        3. Calibrate to experimental scale
+        4. Compute stability score
+        5. Compare with reference data if available
 
         Args:
             smiles: Input SMILES string.
 
         Returns:
-            StrainReport with full analysis results.
+            StrainReport with full analysis results. Check
+            ``is_supported`` to determine if the molecule was processed.
 
         Raises:
-            ValueError: Invalid SMILES or no rings detected.
-            RuntimeError: MMFF94 computation failed.
+            ValueError: Invalid SMILES string.
         """
         # --- Step 1: Parse ---
         if not smiles or not smiles.strip():
@@ -219,52 +319,178 @@ class StrainAnalyzer:
 
         warnings: List[str] = []
 
-        # --- Step 2: Ring analysis ---
+        # --- Stereochemistry: if the input has unassigned ring stereocenters
+        # whose configuration affects strain (e.g. 1,3-di-tert-butyl-
+        # cyclohexane cis vs trans), enumerate diastereomers and report
+        # the strain range. We only branch when there are >= 2 unassigned
+        # ring centers AND we haven't already been called for an isomer
+        # (`_enumerated_from_smiles` is the sentinel).
+        stereo_range = self._maybe_enumerate_stereo(smiles, mol)
+        if stereo_range is not None:
+            return stereo_range
+
+        # --- Step 2: Ring validation ---
         ring_analyzer = RingAnalyzer(mol)
-        if not ring_analyzer.has_rings():
-            return self._no_ring_report(smiles, mol)
+        is_valid, message, ring_info = ring_analyzer.validate()
 
-        ring_info = ring_analyzer.identify_all_rings()
+        if not is_valid:
+            return self._not_supported_report(smiles, mol, message)
 
-        # --- Step 3: Raw MMFF94 strain ---
+        assert ring_info is not None
+
+        # Check if substituted (has atoms beyond the ring)
+        is_substituted = mol.GetNumHeavyAtoms() > ring_info.size
+
+        # --- Step 3: Generate optimized cyclic conformers ---
+        monte_carlo_used = False
         try:
-            raw_strain, raw_per_ring, components = self.homo_analyzer.compute_total_strain(
-                mol, ring_info
+            cyclic_result = self.mmff_calc.embed_and_optimize(Chem.Mol(mol))
+            cyclic_mol = cyclic_result.molecule
+            best_conf_id = cyclic_result.best_conf_id
+
+            # Seed extra ring-puckering conformers (chair/twist-boat/envelope/
+            # boat for 4-7 rings). Standard ETKDG can get locked into a single
+            # puckering basin when many substituent torsions dominate; random-
+            # coords DG + MMFF relax forces exploration of all puckering modes
+            # before MC/PT refines substituent rotamers on top.
+            if is_substituted and 4 <= ring_info.size <= 7:
+                try:
+                    self.mmff_calc.seed_ring_pucker_conformers(
+                        cyclic_mol,
+                        ring_info.atom_indices,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Ring puckering seed failed for %s: %s.", smiles, exc,
+                    )
+
+            # For substituted cycloalkanes: parallel-tempering or plain MC
+            # torsion search to capture steric effects between substituents.
+            # Step counts and replica spread scale with the molecule's bulk
+            # score (branching-weighted substituent complexity) so a tert-
+            # butyl-substituted ring gets ~3x more sampling than a methyl-
+            # substituted one of the same heavy-atom count.
+            if is_substituted and self.use_monte_carlo:
+                try:
+                    bulk = self.mmff_calc.compute_bulk_score(cyclic_mol)
+                    pt_steps = max(100, self.mc_steps // 4) + 30 * bulk
+                    mc_steps_eff = self.mc_steps + 40 * bulk
+                    # Add a fifth 800 K replica for very bulky systems —
+                    # widens the temperature ladder so swaps cover a broader
+                    # energy band, helping cross higher steric barriers.
+                    if bulk >= 12:
+                        pt_temps = (300.0, 500.0, 800.0, 1200.0, 2000.0)
+                    else:
+                        pt_temps = (300.0, 500.0, 1000.0, 2000.0)
+
+                    if self.use_parallel_tempering:
+                        mc_best_id, _ = self.mmff_calc.parallel_tempering_search(
+                            cyclic_mol,
+                            n_steps=pt_steps,
+                            temperatures=pt_temps,
+                        )
+                    else:
+                        mc_best_id, _ = self.mmff_calc.monte_carlo_search(
+                            cyclic_mol, n_steps=mc_steps_eff,
+                        )
+                    if mc_best_id >= 0:
+                        best_conf_id = mc_best_id
+                        monte_carlo_used = True
+                except Exception as exc:
+                    logger.warning(
+                        "Monte Carlo search failed for %s: %s. Using ETKDG result.",
+                        smiles, exc,
+                    )
+
+            # Cluster conformers + Boltzmann average for substituted rings.
+            boltzmann_energy = None
+            if self.use_boltzmann and is_substituted:
+                try:
+                    kept = self.mmff_calc.cluster_conformers(
+                        cyclic_mol,
+                        rmsd_threshold=0.5,
+                        energy_window_kcal=8.0,
+                    )
+                    if len(kept) >= 2:
+                        keep_confs = [
+                            Chem.Conformer(cyclic_mol.GetConformer(c))
+                            for c in kept
+                        ]
+                        cyclic_mol.RemoveAllConformers()
+                        for c in keep_confs:
+                            cyclic_mol.AddConformer(c, assignId=True)
+
+                        # Lowest-energy representative for geometry analysis.
+                        best_conf_id = -1
+                        e_min = float("inf")
+                        for conf in cyclic_mol.GetConformers():
+                            cid = conf.GetId()
+                            e = self.mmff_calc.compute_single_point_energy(
+                                cyclic_mol, conf_id=cid,
+                            )
+                            if e < e_min:
+                                e_min = e
+                                best_conf_id = cid
+
+                        boltzmann_energy = (
+                            self.mmff_calc.compute_boltzmann_energy(
+                                cyclic_mol, temperature=298.15,
+                            )
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Boltzmann averaging failed for %s: %s.", smiles, exc,
+                    )
+
+            # Reduce to single representative conformer for downstream calc.
+            if best_conf_id >= 0 and cyclic_mol.GetNumConformers() > 1:
+                best_conf = Chem.Conformer(cyclic_mol.GetConformer(best_conf_id))
+                cyclic_mol.RemoveAllConformers()
+                cyclic_mol.AddConformer(best_conf, assignId=True)
+
+            raw_strain, components = self.homo_analyzer.compute_strain(
+                mol, ring_info, cyclic_mol=cyclic_mol,
+                cyclic_energy_override=boltzmann_energy,
+                use_boltzmann=self.use_boltzmann,
             )
+
+            # --- Geometry analysis (Baeyer/Pitzer/transannular) ---
+            geo_breakdown = None
+            baeyer_rms = None
+            pitzer_ne = None
+            transann = None
+            if best_conf_id >= 0:
+                try:
+                    geo = GeometryAnalyzer(cyclic_mol, conf_id=best_conf_id)
+                    geo_breakdown = geo.analyze_ring(
+                        tuple(ring_info.atom_indices)
+                    )
+                    baeyer_rms = geo_breakdown["angle_strain"]["rms_deviation"]
+                    pitzer_ne = geo_breakdown["torsional_strain"]["n_eclipsed"]
+                    transann = geo_breakdown["transannular_contacts"]
+                except Exception:
+                    pass
+
+            steric_conf = components.get("steric_confinement_kcal_mol", 0.0)
+            if steric_conf != steric_conf:  # NaN guard
+                steric_conf = 0.0
         except Exception as exc:
             raise RuntimeError(
                 f"MMFF94 computation failed for {smiles!r}: {exc}"
             ) from exc
 
         # --- Step 4: Calibrate ---
-        ring_sizes = [r.size for r in ring_info.rings]
-
-        # Polycyclic systems (fused, bridged, spiro, cage) should NOT use
-        # per-ring-size calibration factors derived from monocyclic compounds.
-        # The ring-opening method already produces values closer to experimental
-        # scale for these systems (e.g., norbornane raw=14.3 vs exp=15.0).
-        if ring_info.has_polycyclic:
-            calibrated = max(raw_strain, 0.0)
-            calibrated_per_ring = {
-                idx: max(v, 0.0) for idx, v in raw_per_ring.items()
-            }
-            uncertainty = self.calibrator.estimate_uncertainty(ring_sizes) + 1.0
-        else:
-            calibrated = self.calibrator.calibrate(raw_strain, ring_sizes)
-            uncertainty = self.calibrator.estimate_uncertainty(ring_sizes)
-            # Per-ring calibration
-            ring_size_map = {r.ring_index: r.size for r in ring_info.rings}
-            calibrated_per_ring = self.calibrator.calibrate_per_ring(
-                raw_per_ring, ring_size_map
-            )
+        calibrated = self.calibrator.calibrate(raw_strain, ring_info.size)
+        uncertainty = self.calibrator.estimate_uncertainty(ring_info.size)
+        if is_substituted:
+            uncertainty += 1.5
 
         # --- Step 5: Stability score ---
         score = self.scorer.compute_score(calibrated)
-        per_ring_scores = self.scorer.compute_per_ring_scores(calibrated_per_ring)
         category = self.scorer.categorize(score)
 
         # --- Step 6: Reference comparison ---
-        ref_match = self._find_reference_match(mol, calibrated, ring_info)
+        ref_match = self._find_reference_match(mol, calibrated)
 
         # --- Diagnostics ---
         mmff_coverage = MMFFCalculator.check_mmff_coverage(mol)
@@ -274,31 +500,6 @@ class StrainAnalyzer:
                 f"Results may be less accurate for atoms without MMFF94 params."
             )
 
-        # Build per-ring details
-        per_ring_details = []
-        for ring in ring_info.rings:
-            per_ring_details.append({
-                "ring_index": ring.ring_index,
-                "size": ring.size,
-                "atoms": list(ring.atom_indices),
-                "type": ring.fusion_type,
-                "is_aromatic": ring.is_aromatic,
-                "is_heterocyclic": ring.is_heterocyclic,
-                "heteroatoms": ring.heteroatom_symbols,
-                "strain_raw_mmff": round(raw_per_ring.get(ring.ring_index, 0.0), 3),
-                "strain_calibrated": round(
-                    calibrated_per_ring.get(ring.ring_index, 0.0), 3
-                ),
-                "score": round(per_ring_scores.get(ring.ring_index, 100.0), 1),
-                "category": self.scorer.categorize(
-                    per_ring_scores.get(ring.ring_index, 100.0)
-                ),
-            })
-
-        # System type
-        system_type = _describe_ring_system(ring_info)
-
-        # Formula and MW
         formula = CalcMolFormula(mol)
         mw = MolWt(mol)
 
@@ -308,9 +509,8 @@ class StrainAnalyzer:
             formula=formula,
             molecular_weight=mw,
             num_heavy_atoms=mol.GetNumHeavyAtoms(),
-            num_rings=ring_info.num_rings,
-            ring_system_type=system_type,
-            ring_sizes=ring_sizes,
+            ring_size=ring_info.size,
+            is_substituted=is_substituted,
             total_strain_mmff_kcal_mol=round(raw_strain, 3),
             total_strain_calibrated_kcal_mol=round(calibrated, 3),
             strain_per_heavy_atom_kcal_mol=round(
@@ -319,16 +519,22 @@ class StrainAnalyzer:
             calibration_uncertainty=round(uncertainty, 1),
             stability_score=round(score, 1),
             stability_category=category,
-            per_ring_scores={
-                k: round(v, 1) for k, v in per_ring_scores.items()
-            },
-            per_ring_details=per_ring_details,
             reference_match=ref_match,
             mmff_coverage=mmff_coverage,
             optimization_converged=True,
             conformers_sampled=self.mmff_calc.n_conformers,
+            monte_carlo_used=monte_carlo_used,
             threshold_kcal_mol=self.scorer.threshold,
             warnings=warnings,
+            geometry_breakdown=geo_breakdown,
+            baeyer_strain_rms_deg=round(baeyer_rms, 2) if baeyer_rms is not None else None,
+            pitzer_n_eclipsed=pitzer_ne,
+            transannular_contacts=transann,
+            steric_confinement_kcal_mol=round(steric_conf, 3) if steric_conf else None,
+            vdw_strain_kcal_mol=_round_or_none(components.get("vdw_strain")),
+            torsion_strain_kcal_mol=_round_or_none(components.get("torsion_strain")),
+            angle_strain_kcal_mol=_round_or_none(components.get("angle_strain")),
+            bond_strain_kcal_mol=_round_or_none(components.get("bond_strain")),
         )
 
     def analyze_batch(
@@ -336,18 +542,7 @@ class StrainAnalyzer:
         smiles_list: List[str],
         show_progress: bool = True,
     ) -> List[StrainReport]:
-        """Batch analysis of multiple SMILES strings.
-
-        Parameters
-        ----------
-        smiles_list : List[str]
-            List of SMILES strings to analyze.
-        show_progress : bool
-            Print progress during batch processing.
-
-        Returns:
-            List of StrainReport, one per SMILES.
-        """
+        """Batch analysis of multiple SMILES strings."""
         results = []
         for i, smi in enumerate(smiles_list):
             if show_progress:
@@ -361,28 +556,36 @@ class StrainAnalyzer:
                     formula="N/A",
                     molecular_weight=0.0,
                     num_heavy_atoms=0,
-                    num_rings=0,
-                    ring_system_type="error",
-                    ring_sizes=[],
+                    ring_size=0,
+                    is_substituted=False,
                     total_strain_mmff_kcal_mol=float("nan"),
                     total_strain_calibrated_kcal_mol=float("nan"),
                     strain_per_heavy_atom_kcal_mol=float("nan"),
                     calibration_uncertainty=0.0,
                     stability_score=0.0,
                     stability_category="error",
-                    per_ring_scores={},
                     mmff_coverage=0.0,
                     optimization_converged=False,
                     conformers_sampled=0,
+                    monte_carlo_used=False,
+                    is_supported=False,
+                    validation_message=str(exc),
                     warnings=[str(exc)],
                 )
             results.append(report)
         return results
 
-    def compare(self, smiles_a: str, smiles_b: str) -> Tuple[StrainReport, StrainReport, str]:
+    def compare(
+        self, smiles_a: str, smiles_b: str
+    ) -> Tuple[StrainReport, StrainReport, str]:
         """Compare ring strain between two molecules."""
         report_a = self.analyze(smiles_a)
         report_b = self.analyze(smiles_b)
+
+        if not report_a.is_supported:
+            return report_a, report_b, f"{smiles_a} is not supported."
+        if not report_b.is_supported:
+            return report_a, report_b, f"{smiles_b} is not supported."
 
         diff = report_b.total_strain_calibrated_kcal_mol - report_a.total_strain_calibrated_kcal_mol
         if abs(diff) < 0.1:
@@ -416,8 +619,101 @@ class StrainAnalyzer:
     # Internal
     # ------------------------------------------------------------------
 
-    def _no_ring_report(self, smiles: str, mol: Mol) -> StrainReport:
-        """Generate a report for molecules without rings."""
+    def _maybe_enumerate_stereo(
+        self, smiles: str, mol: Mol
+    ) -> Optional[StrainReport]:
+        """If the input has unassigned ring stereo, enumerate diastereomers.
+
+        For substituted rings like 1,3-di-tert-butyl-cyclohexane, the cis vs
+        trans configuration changes strain by ~10 kcal/mol — but a SMILES
+        without ``@`` markers is genuinely ambiguous between them. We detect
+        this case, enumerate via ``EnumerateStereoisomers`` (with
+        ``onlyUnassigned=True``), call ``analyze`` recursively on each
+        canonical isomer SMILES, and return a single report carrying the
+        (min, max) calibrated-strain range along with the lowest-strain
+        isomer's full diagnostics.
+
+        Returns ``None`` if no enumeration is needed (stereo fully specified,
+        or only one isomer exists in the unassigned set), so the caller
+        proceeds with normal single-molecule analysis.
+        """
+        try:
+            centers = Chem.FindMolChiralCenters(
+                mol, includeUnassigned=True, useLegacyImplementation=False,
+            )
+        except Exception:
+            return None
+
+        # Only branch on unassigned centers that sit on ring atoms.
+        ring_atom_set = set()
+        for ring in mol.GetRingInfo().AtomRings():
+            ring_atom_set.update(ring)
+        unassigned_ring = [
+            idx for idx, label in centers
+            if label == "?" and idx in ring_atom_set
+        ]
+        if len(unassigned_ring) < 2:
+            return None
+
+        try:
+            from rdkit.Chem.EnumerateStereoisomers import (
+                EnumerateStereoisomers, StereoEnumerationOptions,
+            )
+        except ImportError:
+            return None
+
+        opts = StereoEnumerationOptions(
+            onlyUnassigned=True, unique=True, maxIsomers=8,
+        )
+        try:
+            isomers = list(EnumerateStereoisomers(mol, options=opts))
+        except Exception as exc:
+            logger.warning("Stereo enumeration failed for %s: %s", smiles, exc)
+            return None
+
+        if len(isomers) < 2:
+            return None
+
+        # Analyze each canonical isomer; the enumerated mols have all stereo
+        # assigned, so the recursive analyze() call's stereo check returns
+        # None and falls through to normal analysis — no infinite loop.
+        per_isomer: List[StrainReport] = []
+        for iso in isomers:
+            iso_smiles = Chem.MolToSmiles(iso, canonical=True, isomericSmiles=True)
+            try:
+                rep = self.analyze(iso_smiles)
+            except Exception as exc:
+                logger.warning(
+                    "Stereoisomer %s analysis failed: %s", iso_smiles, exc,
+                )
+                continue
+            if rep.is_supported:
+                per_isomer.append(rep)
+
+        if not per_isomer:
+            return None
+
+        # Aggregate: take the lowest-strain isomer as the primary report,
+        # attach (min, max) range and a warning for the user.
+        per_isomer.sort(key=lambda r: r.total_strain_calibrated_kcal_mol)
+        primary = per_isomer[0]
+        strains = [r.total_strain_calibrated_kcal_mol for r in per_isomer]
+        primary.strain_range_kcal_mol = (
+            round(min(strains), 3), round(max(strains), 3),
+        )
+        primary.stereoisomers_analyzed = len(per_isomer)
+        primary.smiles = smiles  # preserve user's input
+        primary.warnings = list(primary.warnings) + [
+            f"Stereochemistry unspecified — analyzed {len(per_isomer)} "
+            f"diastereomers; reporting the lowest-strain isomer with "
+            f"(min, max) range across all."
+        ]
+        return primary
+
+    def _not_supported_report(
+        self, smiles: str, mol: Mol, message: str
+    ) -> StrainReport:
+        """Generate a report for unsupported molecules."""
         formula = CalcMolFormula(mol)
         mw = MolWt(mol)
         return StrainReport(
@@ -426,27 +722,27 @@ class StrainAnalyzer:
             formula=formula,
             molecular_weight=mw,
             num_heavy_atoms=mol.GetNumHeavyAtoms(),
-            num_rings=0,
-            ring_system_type="acyclic",
-            ring_sizes=[],
+            ring_size=0,
+            is_substituted=False,
             total_strain_mmff_kcal_mol=0.0,
             total_strain_calibrated_kcal_mol=0.0,
             strain_per_heavy_atom_kcal_mol=0.0,
             calibration_uncertainty=0.0,
-            stability_score=100.0,
-            stability_category="strain-free (acyclic)",
-            per_ring_scores={},
+            stability_score=0.0,
+            stability_category="not supported",
             mmff_coverage=1.0,
-            optimization_converged=True,
+            optimization_converged=False,
             conformers_sampled=0,
-            warnings=["Molecule has no rings — strain is zero by definition."],
+            monte_carlo_used=False,
+            is_supported=False,
+            validation_message=message,
+            warnings=[message],
         )
 
     def _find_reference_match(
         self,
         mol: Mol,
         calibrated_strain: float,
-        ring_info: RingSystemInfo,
     ) -> Optional[Dict]:
         """Try to match the molecule against known reference compounds."""
         can_smiles = Chem.MolToSmiles(mol, canonical=True)
@@ -463,46 +759,4 @@ class StrainAnalyzer:
                 "source": ref.source,
             }
 
-        # Try matching by ring sizes
-        sizes = tuple(sorted(r.size for r in ring_info.rings))
-        for candidate in self.ref_db.get_all():
-            c_sizes = tuple(sorted(candidate.ring_sizes))
-            if sizes == c_sizes:
-                return {
-                    "name": candidate.name,
-                    "smiles": candidate.smiles,
-                    "exp_strain": candidate.strain_energy_kcal_mol,
-                    "computed_strain": calibrated_strain,
-                    "absolute_error": round(
-                        abs(calibrated_strain - candidate.strain_energy_kcal_mol), 2
-                    ),
-                    "source": f"matched by ring sizes {sizes}; exact SMILES may differ",
-                    "approximate_match": True,
-                }
-
         return None
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _describe_ring_system(ring_info: RingSystemInfo) -> str:
-    """Generate a human-readable description of the ring system."""
-    if ring_info.num_rings == 0:
-        return "acyclic"
-    if ring_info.num_rings == 1:
-        size = ring_info.rings[0].size
-        aro = "aromatic " if ring_info.rings[0].is_aromatic else ""
-        het = "heterocyclic " if ring_info.rings[0].is_heterocyclic else ""
-        return f"{aro}{het}monocyclic ({size}-membered)"
-    if ring_info.has_polycyclic:
-        types = set(ring_info.ring_system_types)
-        if "cage" in types:
-            return f"polycyclic cage ({ring_info.num_rings} rings)"
-        if "bridged" in types:
-            return f"bridged polycyclic ({ring_info.num_rings} rings)"
-        if "spiro" in types:
-            return f"spiro polycyclic ({ring_info.num_rings} rings)"
-        return f"fused polycyclic ({ring_info.num_rings} rings)"
-    return f"polycyclic ({ring_info.num_rings} rings)"

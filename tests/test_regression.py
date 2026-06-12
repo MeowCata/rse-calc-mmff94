@@ -2,14 +2,15 @@
 Regression tests for ring strain analysis.
 
 Validates computed strain values against known experimental values
-for standard cycloalkanes (C3-C8) and representative polycyclic compounds.
+for monocyclic saturated carbocycles (cycloalkanes C3-C8) and verifies
+"Not Supported" behavior for polycyclic, heterocyclic, aromatic, and
+unsaturated inputs.
 """
 
 import pytest
 from mmff94.ring_strain.core import StrainAnalyzer
 
 # Tolerance: +/- 5 kcal/mol for calibrated values
-# (MMFF94 systematic errors + calibration interpolation)
 _CALIBRATED_TOLERANCE = 5.0
 
 # Known experimental values for core cycloalkanes
@@ -20,12 +21,6 @@ _CYCLOALKANE_REFERENCE = {
     "C1CCCCC1": 0.0,    # cyclohexane
     "C1CCCCCC1": 6.3,   # cycloheptane
     "C1CCCCCCC1": 9.7,  # cyclooctane
-}
-
-# Known values for polycyclic / other compounds
-_OTHER_REFERENCE = {
-    "c1ccccc1": 0.0,     # benzene (aromatic, strain-free)
-    "C1CC2CCC1C2": 15.0, # norbornane
 }
 
 
@@ -41,6 +36,7 @@ class TestCycloalkaneStrain:
     @pytest.mark.parametrize("smiles,expected", _CYCLOALKANE_REFERENCE.items())
     def test_cycloalkane_strain(self, analyzer, smiles, expected):
         report = analyzer.analyze(smiles)
+        assert report.is_supported, f"{smiles} should be supported"
         error = abs(report.total_strain_calibrated_kcal_mol - expected)
         assert error < _CALIBRATED_TOLERANCE, (
             f"{smiles}: computed {report.total_strain_calibrated_kcal_mol:.1f} "
@@ -61,11 +57,11 @@ class TestRingSizes:
     ])
     def test_ring_size_detection(self, analyzer, smiles, expected_size):
         report = analyzer.analyze(smiles)
-        assert report.ring_sizes == [expected_size]
+        assert report.ring_size == expected_size
 
 
 class TestAcyclicMolecules:
-    """Test that molecules without rings return zero strain."""
+    """Test that molecules without rings are flagged as not supported."""
 
     @pytest.mark.parametrize("smiles", [
         "CC",           # ethane
@@ -74,25 +70,28 @@ class TestAcyclicMolecules:
         "CCO",          # ethanol (acyclic)
         "CC(=O)O",      # acetic acid
     ])
-    def test_acyclic_zero_strain(self, analyzer, smiles):
+    def test_acyclic_not_supported(self, analyzer, smiles):
         report = analyzer.analyze(smiles)
-        assert report.num_rings == 0
-        assert report.stability_score >= 99.0
+        assert not report.is_supported
+        assert "no rings" in report.validation_message.lower()
 
 
-class TestAromaticRings:
-    """Test that aromatic rings score as stable."""
+class TestNotSupported:
+    """Test that unsupported ring systems are rejected."""
 
-    @pytest.mark.parametrize("smiles", [
-        "c1ccccc1",     # benzene
-        "c1ccncc1",     # pyridine
+    @pytest.mark.parametrize("smiles,expected_substring", [
+        ("c1ccccc1", "aromatic"),              # benzene (now unsupported)
+        ("c1ccncc1", "heteroatom"),             # pyridine (N in ring detected first)
+        ("C1CC2CCC1C2", "polycyclic"),         # norbornane
+        ("C1C2CC3CC1CC(C2)C3", "polycyclic"),  # adamantane
+        ("C1=CCCCC1", "unsaturated"),          # cyclohexene
+        ("C1CCOC1", "heteroatom"),             # THF
+        ("C1CCNCC1", "heteroatom"),            # piperidine
     ])
-    def test_aromatic_stable(self, analyzer, smiles):
+    def test_not_supported(self, analyzer, smiles, expected_substring):
         report = analyzer.analyze(smiles)
-        assert report.stability_score > 80.0, (
-            f"{smiles}: score={report.stability_score:.1f}, "
-            f"expected > 80 (aromatic stabilization)"
-        )
+        assert not report.is_supported
+        assert expected_substring.lower() in report.validation_message.lower()
 
 
 class TestStabilityScore:
@@ -125,6 +124,21 @@ class TestStabilityScore:
         assert strains["C1CCCC1"] > strains["C1CCCCC1"]
 
 
+class TestSubstitutedCycloalkanes:
+    """Test substituted cycloalkane strain computation."""
+
+    def test_tbutyl_cyclopropane_strain(self, analyzer):
+        """trans-1,2-di-tert-butylcyclopropane should show elevated strain
+        vs unsubstituted cyclopropane (27.5 kcal/mol) due to steric effects."""
+        # This is a sterically congested cyclopropane
+        smi = "CC(C)(C)C1CC1C(C)(C)C"
+        report = analyzer.analyze(smi)
+        assert report.is_supported, f"Substituted cyclopropane should be supported"
+        assert report.is_substituted
+        # Strain should be at least as high as unsubstituted cyclopropane
+        assert report.total_strain_calibrated_kcal_mol > 0
+
+
 class TestInvalidInputs:
     """Test graceful handling of invalid inputs."""
 
@@ -146,6 +160,8 @@ class TestReportFormat:
         assert "smiles" in d
         assert "total_strain_calibrated_kcal_mol" in d
         assert "stability_score" in d
+        assert "ring_size" in d
+        assert "is_supported" in d
 
     def test_to_json(self, analyzer):
         report = analyzer.analyze("C1CC1")
@@ -155,4 +171,24 @@ class TestReportFormat:
     def test_print_summary(self, analyzer):
         report = analyzer.analyze("C1CC1")
         s = report.print_summary()
-        assert "cyclopropane" in s.lower() or "C1CC1" in s or "Ring Strain" in s
+        assert "Ring Strain" in s
+
+    def test_not_supported_to_dict(self, analyzer):
+        report = analyzer.analyze("c1ccccc1")  # benzene
+        d = report.to_dict()
+        assert not d["is_supported"]
+        assert d["validation_message"]
+
+
+class TestReferenceMatch:
+    """Test reference compound matching."""
+
+    def test_cyclopropane_matches_reference(self, analyzer):
+        report = analyzer.analyze("C1CC1")
+        assert report.reference_match is not None
+        assert "cyclopropane" in report.reference_match["name"].lower()
+
+    def test_cyclohexane_matches_reference(self, analyzer):
+        report = analyzer.analyze("C1CCCCC1")
+        assert report.reference_match is not None
+        assert report.reference_match["exp_strain"] == 0.0
