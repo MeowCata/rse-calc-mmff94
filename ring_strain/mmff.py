@@ -535,10 +535,18 @@ class MMFFCalculator:
             return 1
 
         n_rot_bonds = Chem.rdMolDescriptors.CalcNumRotatableBonds(mol)
-        bulk = self.compute_bulk_score(mol)
+        # Cap bulk at 15 for sampling-budget purposes: beyond that the
+        # conformer space is dominated by long-range vdW couplings that
+        # are already covered by PT replicas, so adding linearly more
+        # conformers gives diminishing returns.
+        bulk = min(15, self.compute_bulk_score(mol))
 
-        effective = 50 + 40 * n_rot_bonds + 25 * bulk
-        upper = max(self.n_conformers, 5000)
+        # Reduced from 50+40r+25b (cap 5000) — that produced 510-conformer
+        # pools for tert-butyl-substituted rings, taking ~30 s just in
+        # initial MMFF optimization. The smaller pool still seeds every
+        # major basin once combined with random-coords ring puckering seeds.
+        effective = 30 + 20 * n_rot_bonds + 15 * bulk
+        upper = max(self.n_conformers, 1500)
         effective = max(20, min(upper, effective))
 
         logger.debug(

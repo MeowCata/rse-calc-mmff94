@@ -198,32 +198,30 @@ class HomodesmoticAnalyzer:
                 acyclic_with_H = acyclic_result.molecule
                 acyclic_energy = acyclic_result.total_energy
 
-                # Acyclic torsion-diversity seeds: random-coords ETKDG hits
-                # both extended (anti) and gauche rotamer families for the
-                # chain backbone. Without this, the lowest-energy acyclic
-                # geometry can be biased by whatever rotamer family ETKDG
-                # happens to seed — which inflates `cyclic_E - acyclic_E`
-                # for bulky substituted rings.
-                try:
-                    self.mmff.seed_random_coords_conformers(
-                        acyclic_with_H, n_seeds=20, seed_offset=3000,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Acyclic random-coords seeding failed: %s", exc,
-                    )
+                # Symmetric bulk-aware scaling on the acyclic side, capped
+                # at bulk=15 (see mmff.py for rationale).
+                bulk = min(15, self.mmff.compute_bulk_score(acyclic_with_H))
 
-                # Symmetric bulk-aware scaling on the acyclic side: matches
-                # the cyclic-side search depth so neither pool gets a sampling
-                # advantage that would bias `cyclic_E - acyclic_E`.
-                bulk = self.mmff.compute_bulk_score(acyclic_with_H)
-                pt_steps_eff = 150 + 30 * bulk
-                mc_steps_eff = 200 + 40 * bulk
-                pt_temps_eff = (
-                    (300.0, 500.0, 800.0, 1200.0, 2000.0)
-                    if bulk >= 12
-                    else (300.0, 500.0, 1000.0, 2000.0)
-                )
+                # Acyclic torsion-diversity seeds: random-coords ETKDG hits
+                # both extended (anti) and gauche rotamer families. Skip for
+                # low-bulk substrates — those chains are well-covered by
+                # default ETKDG and the seeding overhead (1-2 s) is wasted.
+                if bulk >= 4:
+                    try:
+                        self.mmff.seed_random_coords_conformers(
+                            acyclic_with_H,
+                            n_seeds=min(20, 10 + bulk),
+                            seed_offset=3000,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Acyclic random-coords seeding failed: %s", exc,
+                        )
+
+                pt_steps_eff = 150 + 12 * bulk
+                mc_steps_eff = 200 + 18 * bulk
+                # 4 replicas always — see core.py.
+                pt_temps_eff = (300.0, 500.0, 1000.0, 2000.0)
 
                 # Monte Carlo / PT torsion search
                 try:
@@ -300,6 +298,12 @@ class HomodesmoticAnalyzer:
         """
         results: List[Tuple[Mol, int]] = []
         ring_atom_set = set(ring_info.atom_indices)
+        # Dedupe by canonical SMILES: ring symmetry makes many openings
+        # produce the identical molecule (e.g. methylcyclohexane gives only
+        # 4 distinct chains from 6 ring bonds; 1,1-dimethylcyclohexane just
+        # 2). Each unique chain still gets the full MC/PT + Boltzmann pass;
+        # we just avoid paying for it 2-3x over.
+        seen_canonical = set()
 
         for bidx in ring_info.bond_indices:
             rw_mol = RWMol(mol)
@@ -320,7 +324,16 @@ class HomodesmoticAnalyzer:
                     bidx, exc,
                 )
                 continue
-            results.append((rw_mol.GetMol(), bidx))
+            acyclic_mol = rw_mol.GetMol()
+            try:
+                can = Chem.MolToSmiles(acyclic_mol, canonical=True)
+            except Exception:
+                can = None
+            if can is not None:
+                if can in seen_canonical:
+                    continue
+                seen_canonical.add(can)
+            results.append((acyclic_mol, bidx))
 
         if not results:
             raise RuntimeError(

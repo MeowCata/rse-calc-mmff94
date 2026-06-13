@@ -163,14 +163,32 @@ class StrainCalibrator:
         ref: ReferenceCompound,
         smiles: str,
     ) -> Optional[float]:
-        """Compute raw MMFF94 homodesmotic strain for a reference compound."""
+        """Compute raw MMFF94 homodesmotic strain for a reference compound.
+
+        Returns ``None`` for substituted references (heavy-atom count >
+        sum of ring sizes), which must NOT contribute to the per-ring-size
+        calibration regression: the strict-bond-balanced cycloalkane raw
+        strain is the same for all 6-rings, but experimental strain
+        differs for substituted variants — mixing them would pin the
+        factor at ``exp_substituted / 0`` (catastrophic).
+
+        Substituted references still appear in ``ref_db.get_by_smiles``
+        for user-facing comparison; they just don't feed the regression.
+        """
         from rdkit import Chem
 
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             return None
 
-        # All calibration references are simple cycloalkanes - use strict method
+        # Substitution test: substituted compounds have heavy atoms beyond
+        # the ring. Single-ring assumption is valid here (calibration set
+        # is monocyclic).
+        if ref.ring_sizes:
+            ring_total = sum(ref.ring_sizes)
+            if mol.GetNumHeavyAtoms() > ring_total:
+                return None
+
         if ref.ring_sizes and ref.ring_sizes[0] <= 8:
             return self.homo_analyzer.compute_cycloalkane_strain(ref.ring_sizes[0])
 

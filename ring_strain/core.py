@@ -372,16 +372,16 @@ class StrainAnalyzer:
             # substituted one of the same heavy-atom count.
             if is_substituted and self.use_monte_carlo:
                 try:
-                    bulk = self.mmff_calc.compute_bulk_score(cyclic_mol)
-                    pt_steps = max(100, self.mc_steps // 4) + 30 * bulk
-                    mc_steps_eff = self.mc_steps + 40 * bulk
-                    # Add a fifth 800 K replica for very bulky systems —
-                    # widens the temperature ladder so swaps cover a broader
-                    # energy band, helping cross higher steric barriers.
-                    if bulk >= 12:
-                        pt_temps = (300.0, 500.0, 800.0, 1200.0, 2000.0)
-                    else:
-                        pt_temps = (300.0, 500.0, 1000.0, 2000.0)
+                    # Cap bulk at 15 for sampling depth — see mmff.py for
+                    # the rationale (diminishing returns + PT replicas
+                    # already cover long-range vdW couplings).
+                    bulk = min(15, self.mmff_calc.compute_bulk_score(cyclic_mol))
+                    pt_steps = max(100, self.mc_steps // 4) + 12 * bulk
+                    mc_steps_eff = self.mc_steps + 18 * bulk
+                    # 4 replicas always — the 5th 800 K replica we tried
+                    # cost 25 % more per step for negligible accuracy gain
+                    # on the heavily-substituted test set.
+                    pt_temps = (300.0, 500.0, 1000.0, 2000.0)
 
                     if self.use_parallel_tempering:
                         mc_best_id, _ = self.mmff_calc.parallel_tempering_search(
