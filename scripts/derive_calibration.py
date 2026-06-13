@@ -21,11 +21,11 @@ import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-# Allow `python -m scripts.derive_calibration` from project root.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+# Run from project root: `python scripts/derive_calibration.py`.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mmff94.ring_strain.core import StrainAnalyzer
-from mmff94.ring_strain.calibrate import _fit_size_coefficients
+from ring_strain.core import StrainAnalyzer
+from ring_strain.calibrate import _fit_size_coefficients
 
 
 OUTPUT_PATH = (

@@ -9,7 +9,7 @@ Demonstrates:
 - Handling "Not Supported" inputs
 """
 
-from mmff94.ring_strain.core import StrainAnalyzer
+from ring_strain.core import StrainAnalyzer
 
 
 def main():

@@ -8,7 +8,7 @@ unsaturated inputs.
 """
 
 import pytest
-from mmff94.ring_strain.core import StrainAnalyzer
+from ring_strain.core import StrainAnalyzer
 
 # Tolerance: +/- 5 kcal/mol for calibrated values
 _CALIBRATED_TOLERANCE = 5.0

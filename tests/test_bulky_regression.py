@@ -18,8 +18,8 @@ import pytest
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
-from mmff94.ring_strain.mmff import MMFFCalculator
-from mmff94.ring_strain.core import StrainAnalyzer
+from ring_strain.mmff import MMFFCalculator
+from ring_strain.core import StrainAnalyzer
 
 
 # ---------------------------------------------------------------------------

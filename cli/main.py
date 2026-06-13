@@ -13,12 +13,8 @@ Usage:
 import argparse
 import json
 import sys
-from pathlib import Path
 
-# Add parent to path so we can run as python mmff94/cli/main.py
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-
-from mmff94.ring_strain.core import StrainAnalyzer, StrainReport
+from ring_strain.core import StrainAnalyzer, StrainReport
 
 
 def _build_parser() -> argparse.ArgumentParser:

@@ -16,7 +16,7 @@ deciding whether to add a bulk-class calibration term in
 import os
 import pytest
 
-from mmff94.ring_strain.core import StrainAnalyzer
+from ring_strain.core import StrainAnalyzer
 
 
 pytestmark = pytest.mark.skipif(
