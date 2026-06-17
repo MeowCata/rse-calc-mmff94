@@ -6,6 +6,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MMFF94-based ring-strain energy quantification for **monocyclic saturated carbocycles only**. Inputs that are polycyclic (bridged / fused / spiro), heterocyclic, aromatic, or unsaturated are rejected with `is_supported=False` and a "Not Supported" message — do not extend the analysis pipeline to other ring systems without first consulting `instructions.md`, which fixes this scope.
 
+The intended use case is **synthesizable real-world rings**: predict strain (including steric / vdW contributions) and discriminate stereoisomers (cis/trans) for compounds that may or may not be in the reference database. Generalization is achieved by per-ring-size linear calibration over a curated set of literature anchors plus a force-field-native stereoisomer gap that bypasses calibration entirely.
+
+## Known limitations: extreme crowding
+
+The homodesmotic ring-opening reference becomes unphysical for **all-substituted small rings** where every ring carbon carries multiple non-H substituents. Examples observed in `issue.txt` (DeepSeek gradient-pressure test):
+
+- 1,1,2,2-tetraethylcyclopropane: model +28.16 kcal/mol — calibrated strain order vs the methyl analog inverted.
+- hexamethylcyclopropane: model +27.41 kcal/mol — qualitatively below tetra-tert-butyl despite stronger crowding.
+- hexaethylcyclopropane: **raw MMFF strain −10.62 kcal/mol**, all four energy decomposition terms (vdW, torsion, angle, bond) negative. Calibration force-pushes this back to +12.65 but the number has no physical meaning.
+
+Root cause: in the open-chain reference, every methyl/ethyl pair contributes a vdW repulsion that is *also* present in the ring; the difference `cyclic − acyclic` then cancels the very strain it should expose. The per-size linear calibrator cannot recover meaningful strain when the raw energy decomposition itself flips sign.
+
+These compounds are at best fleeting laboratory curiosities (hexaethylcyclopropane has not been synthesized as of literature consulted), so this failure zone is documented rather than fixed. **Do not attempt to expand the analysis to multi-substituent small rings without changing the reference reaction to a strict bond-balanced scheme** (which is path 2 of `plans/humming-wobbling-porcupine.md` and was deliberately not taken).
+
 ## Running
 
 All commands run from this directory (`C:\Users\miaoc\Desktop\mmff94`). Imports inside the codebase are top-level (`from ring_strain.core import ...`), so the project root must be on `sys.path` — which it automatically is when invoked via `python -m ...` from here.
@@ -41,13 +55,13 @@ RUN_BENCHMARKS=1 python -m pytest tests/test_bulky_benchmark.py   # 8-compound b
 python -m pytest tests/test_regression.py::TestCycloalkaneStrain::test_cycloalkane_strain
 ```
 
-`tests/test_bulky_benchmark.py` is skipped by default; set `RUN_BENCHMARKS=1` to run it. The core cycloalkane regression uses a ±5 kcal/mol tolerance vs literature; the bulky benchmark uses ±2.5 kcal/mol and currently fails on the 1,3-di-tert-butyl-cyclohexane cis/trans pair — that residual is a known MMFF94 limitation (the force field inverts the experimental ranking on that pair).
+`tests/test_bulky_benchmark.py` is skipped by default; set `RUN_BENCHMARKS=1` to run it. The core cycloalkane regression uses a ±5 kcal/mol tolerance vs literature; the bulky benchmark uses ±2.5 kcal/mol.
 
 ## Architecture
 
 `StrainAnalyzer.analyze(smiles)` in `ring_strain/core.py` is the single entry point; everything else is a collaborator it instantiates. The pipeline is:
 
-1. **Parse + stereo enumeration** (`core._maybe_enumerate_stereo`) — if the SMILES has ≥2 unassigned ring stereocenters (e.g. 1,3-di-tert-butyl-cyclohexane without `@` markers), `EnumerateStereoisomers` is invoked, `analyze` recurses on each canonical isomer, and the lowest-strain report is returned with `strain_range_kcal_mol = (min, max)` and `stereoisomers_analyzed` attached. The recursion terminates because enumerated isomers have stereo fully assigned.
+1. **Parse + stereo enumeration** (`core._maybe_enumerate_stereo`) — if the SMILES has ≥2 unassigned ring stereocenters (e.g. 1,3-di-tert-butyl-cyclohexane without `@` markers), `EnumerateStereoisomers` is invoked, `analyze` recurses on each canonical isomer, and the lowest-strain report is returned with `strain_range_kcal_mol = (min, max)` and `stereoisomers_analyzed` attached. The recursion terminates because enumerated isomers have stereo fully assigned. The report additionally exposes `stereoisomer_breakdown` (per-isomer SMILES + calibrated + raw + cyclic energy) and `stereoisomer_cyclic_gap_kcal_mol` (max−min of the raw MMFF cyclic energy across diastereomers). **The cyclic-energy gap is the force-field-native cis/trans discrimination metric** — it bypasses the acyclic reference and per-size calibration, both of which can compress small isomer differences when the size-N calibration slope is well below 1. Use this field when reporting stereo gaps; use `total_strain_calibrated_kcal_mol` for absolute strain comparisons.
 2. **Ring validation** (`ring_analysis.RingAnalyzer.validate`) — rejects everything outside monocyclic saturated carbocycles.
 3. **Cyclic conformer search** (`mmff.MMFFCalculator`) — ETKDG embed + MMFF94 optimize all conformers in parallel. For substituted 4–7 rings, `seed_ring_pucker_conformers` then adds extra random-coords ETKDG seeds (`useRandomCoords=True`, `clearConfs=False`) so chair / twist-boat / envelope / half-chair basins are all sampled. PT + MC torsion search follows, with step counts and conformer count scaling on `compute_bulk_score(mol)`. Cluster + Boltzmann-average the surviving conformers when `use_boltzmann=True`.
 4. **Strain calculation** (`homodesmotic.HomodesmoticAnalyzer.compute_strain`) — two regimes:

@@ -188,6 +188,61 @@ _REFERENCE_COMPOUNDS: List[ReferenceCompound] = [
         method="combustion",
         notes="gem-dimethyl on cyclohexane; small.",
     ),
+    # -------------------------------------------------------------
+    # Mono-substituted (non-gem) anchors — add diversity to per-size
+    # calibration which was previously gem-only on sizes 3/4/5. These
+    # are all real-world synthesizable compounds with NIST/Wiberg data.
+    # -------------------------------------------------------------
+    ReferenceCompound(
+        name="methylcyclopropane",
+        smiles="CC1CC1",
+        ring_sizes=[3],
+        ring_count=1,
+        strain_energy_kcal_mol=28.4,
+        source="Wiberg (1986) group additivity",
+        method="combustion + group additivity",
+        notes="Single methyl on cyclopropane; mono-substituted anchor.",
+    ),
+    ReferenceCompound(
+        name="methylcyclobutane",
+        smiles="CC1CCC1",
+        ring_sizes=[4],
+        ring_count=1,
+        strain_energy_kcal_mol=26.7,
+        source="NIST WebBook",
+        method="combustion",
+        notes="Single methyl on cyclobutane; mono-substituted anchor.",
+    ),
+    ReferenceCompound(
+        name="methylcyclopentane",
+        smiles="CC1CCCC1",
+        ring_sizes=[5],
+        ring_count=1,
+        strain_energy_kcal_mol=6.4,
+        source="NIST WebBook",
+        method="combustion",
+        notes="Single methyl on cyclopentane; mono-substituted anchor.",
+    ),
+    ReferenceCompound(
+        name="methylcyclohexane",
+        smiles="CC1CCCCC1",
+        ring_sizes=[6],
+        ring_count=1,
+        strain_energy_kcal_mol=1.7,
+        source="NIST WebBook + A-value",
+        method="combustion",
+        notes="Single methyl on cyclohexane; gauche-methyl contribution.",
+    ),
+    ReferenceCompound(
+        name="trans-1,4-dimethylcyclohexane",
+        smiles="C[C@H]1CC[C@H](C)CC1",
+        ring_sizes=[6],
+        ring_count=1,
+        strain_energy_kcal_mol=1.9,
+        source="NIST WebBook",
+        method="combustion",
+        notes="Both methyls equatorial; size-6 stereo anchor at low strain.",
+    ),
 ]
 
 # Build fast lookup maps

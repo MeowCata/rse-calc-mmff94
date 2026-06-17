@@ -126,3 +126,48 @@ class TestStrainReportDecomposition:
         assert rep.torsion_strain_kcal_mol is not None
         # Cyclopropane derivatives: torsion (eclipsed) dominates strain.
         assert abs(rep.torsion_strain_kcal_mol) > 1.0
+
+
+# ---------------------------------------------------------------------------
+# Stereoisomer breakdown + cyclic-energy gap (the cis/trans highlight)
+# ---------------------------------------------------------------------------
+
+class TestStereoIsomerBreakdown:
+    """When stereo is unspecified, breakdown + gap fields are populated."""
+
+    @pytest.fixture(scope="class")
+    def analyzer(self):
+        # Fast wiring test — n_conformers/mc_steps reduced for speed.
+        return StrainAnalyzer(n_conformers=30, mc_steps=80)
+
+    def test_bare_dimethylcyclohexane_has_breakdown(self, analyzer):
+        """1,4-dimethylcyclohexane (bare) populates breakdown + gap."""
+        rep = analyzer.analyze("CC1CCC(C)CC1")
+        assert rep.stereoisomers_analyzed is not None
+        assert rep.stereoisomers_analyzed >= 2
+        assert rep.stereoisomer_breakdown is not None
+        assert len(rep.stereoisomer_breakdown) == rep.stereoisomers_analyzed
+        # The cyclic-energy gap exists and is positive.
+        assert rep.stereoisomer_cyclic_gap_kcal_mol is not None
+        assert rep.stereoisomer_cyclic_gap_kcal_mol > 0
+        # Exactly one entry flagged is_min.
+        n_min = sum(1 for e in rep.stereoisomer_breakdown if e.get("is_min"))
+        assert n_min == 1
+        # Each entry has the expected keys.
+        for entry in rep.stereoisomer_breakdown:
+            assert "smiles" in entry
+            assert "strain_calibrated" in entry
+            assert "strain_mmff" in entry
+            assert "cyclic_energy" in entry
+            assert "is_min" in entry
+
+    def test_unsubstituted_has_no_breakdown(self, analyzer):
+        """Cyclohexane (no stereo) has no breakdown / gap."""
+        rep = analyzer.analyze("C1CCCCC1")
+        assert rep.stereoisomer_breakdown is None
+        assert rep.stereoisomer_cyclic_gap_kcal_mol is None
+
+    def test_substituted_has_cyclic_energy(self, analyzer):
+        """Cyclic_energy is populated on every substituted report."""
+        rep = analyzer.analyze("CC1CCCCC1")  # methylcyclohexane, no stereo
+        assert rep.cyclic_energy_kcal_mol is not None

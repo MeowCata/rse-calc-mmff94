@@ -124,6 +124,25 @@ class StrainReport:
     strain_range_kcal_mol: Optional[Tuple[float, float]] = None
     stereoisomers_analyzed: Optional[int] = None
 
+    # Raw MMFF94 energy of the optimized cyclic structure (Boltzmann-averaged
+    # when use_boltzmann=True and substituted). The stereoisomer gap defined
+    # below is computed as the spread of this value across diastereomers —
+    # bypassing the acyclic reference and per-size calibration, which can
+    # squash isomer differences when the size-N calibration slope is small.
+    cyclic_energy_kcal_mol: Optional[float] = None
+
+    # Per-isomer strain breakdown when stereo was enumerated. Each entry:
+    #   {"smiles": str, "strain_calibrated": float, "strain_mmff": float,
+    #    "cyclic_energy": Optional[float], "is_min": bool}
+    # `None` when stereo was fully specified or only one isomer exists.
+    stereoisomer_breakdown: Optional[List[Dict]] = None
+
+    # max(cyclic_energy) - min(cyclic_energy) across diastereomers. This is
+    # the force-field-native cis/trans energy gap — directly reflects MMFF94's
+    # stereo discrimination without the acyclic-reference / calibration
+    # squashing. `None` when stereo was fully specified or only one isomer.
+    stereoisomer_cyclic_gap_kcal_mol: Optional[float] = None
+
     # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------
@@ -216,14 +235,52 @@ class StrainReport:
                 if val is not None:
                     lines.append(f"  {label} {val:+.2f} kcal/mol")
 
-        if self.strain_range_kcal_mol is not None:
-            lo, hi = self.strain_range_kcal_mol
-            n = self.stereoisomers_analyzed or 0
+        if (self.strain_range_kcal_mol is not None
+                or self.stereoisomer_cyclic_gap_kcal_mol is not None
+                or self.stereoisomer_breakdown):
             lines.append("")
-            lines.append(
-                f"  Stereochemistry unspecified — cis/trans range across "
-                f"{n} diastereomers: {lo:+.2f} to {hi:+.2f} kcal/mol"
-            )
+            lines.append("-" * 60)
+            lines.append("  STEREOISOMER ANALYSIS (cis/trans)")
+            lines.append("-" * 60)
+            n = self.stereoisomers_analyzed or 0
+            if n:
+                lines.append(f"  Diastereomers analyzed:   {n}")
+            if self.stereoisomer_cyclic_gap_kcal_mol is not None:
+                lines.append(
+                    f"  Cyclic-energy gap:        "
+                    f"{self.stereoisomer_cyclic_gap_kcal_mol:+.2f} kcal/mol  "
+                    f"(MMFF94 native — calibration-free)"
+                )
+            if self.strain_range_kcal_mol is not None:
+                lo, hi = self.strain_range_kcal_mol
+                spread = hi - lo
+                lines.append(
+                    f"  Calibrated strain range:  "
+                    f"{lo:+.2f} .. {hi:+.2f} kcal/mol  "
+                    f"(spread {spread:+.2f})"
+                )
+            if self.stereoisomer_breakdown:
+                lines.append("")
+                lines.append("  Per-isomer breakdown (lowest-strain marked *):")
+                for entry in self.stereoisomer_breakdown:
+                    marker = "*" if entry.get("is_min") else " "
+                    ce = entry.get("cyclic_energy")
+                    ce_str = f"  E_cyclic={ce:+7.2f}" if ce is not None else ""
+                    lines.append(
+                        f"  {marker} {entry['smiles']:<32}"
+                        f"  cal={entry['strain_calibrated']:+6.2f}"
+                        f"  raw={entry['strain_mmff']:+6.2f}{ce_str}"
+                    )
+                lines.append("")
+                lines.append(
+                    "  Note: cyclic-energy gap directly reflects MMFF94's stereo"
+                )
+                lines.append(
+                    "  discrimination; calibrated range may compress small gaps"
+                )
+                lines.append(
+                    "  due to per-size calibration slope < 1."
+                )
 
         lines.append("=" * 60)
         return "\n".join(lines)
@@ -535,6 +592,7 @@ class StrainAnalyzer:
             torsion_strain_kcal_mol=_round_or_none(components.get("torsion_strain")),
             angle_strain_kcal_mol=_round_or_none(components.get("angle_strain")),
             bond_strain_kcal_mol=_round_or_none(components.get("bond_strain")),
+            cyclic_energy_kcal_mol=_round_or_none(components.get("cyclic_energy")),
         )
 
     def analyze_batch(
@@ -702,6 +760,33 @@ class StrainAnalyzer:
             round(min(strains), 3), round(max(strains), 3),
         )
         primary.stereoisomers_analyzed = len(per_isomer)
+
+        # Per-isomer breakdown + force-field-native cyclic-energy gap.
+        # The gap is computed from raw MMFF94 cyclic energies (post-
+        # Boltzmann), bypassing the acyclic reference and per-size
+        # calibration. For substituted size-6 rings the size-6 slope
+        # a[6] ≈ 0.29 squashes the calibrated cis/trans gap to ~30 % of
+        # what the force field actually says; the raw cyclic-energy
+        # spread is the more honest stereo-discrimination metric.
+        breakdown: List[Dict] = []
+        for r in per_isomer:
+            breakdown.append({
+                "smiles": r.smiles,
+                "strain_calibrated": r.total_strain_calibrated_kcal_mol,
+                "strain_mmff": r.total_strain_mmff_kcal_mol,
+                "cyclic_energy": r.cyclic_energy_kcal_mol,
+                "is_min": (r is primary),
+            })
+        primary.stereoisomer_breakdown = breakdown
+        cyc_es = [
+            r.cyclic_energy_kcal_mol for r in per_isomer
+            if r.cyclic_energy_kcal_mol is not None
+        ]
+        if len(cyc_es) >= 2:
+            primary.stereoisomer_cyclic_gap_kcal_mol = round(
+                max(cyc_es) - min(cyc_es), 3,
+            )
+
         primary.smiles = smiles  # preserve user's input
         primary.warnings = list(primary.warnings) + [
             f"Stereochemistry unspecified — analyzed {len(per_isomer)} "
