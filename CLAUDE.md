@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project scope
 
-MMFF94-based ring-strain energy quantification for **monocyclic saturated carbocycles only**. Inputs that are polycyclic (bridged / fused / spiro), heterocyclic, aromatic, or unsaturated are rejected with `is_supported=False` and a "Not Supported" message — do not extend the analysis pipeline to other ring systems without first consulting `instructions.md`, which fixes this scope.
+MMFF94-based ring-strain energy quantification for **monocyclic saturated carbocycles only**. Inputs that are polycyclic (bridged / fused / spiro), heterocyclic, aromatic, or unsaturated are rejected with `is_supported=False` and a "Not Supported" message — do not extend the analysis pipeline to other ring systems.
 
 The intended use case is **synthesizable real-world rings**: predict strain (including steric / vdW contributions) and discriminate stereoisomers (cis/trans) for compounds that may or may not be in the reference database. Generalization is achieved by per-ring-size linear calibration over a curated set of literature anchors plus a force-field-native stereoisomer gap that bypasses calibration entirely.
 
