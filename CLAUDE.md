@@ -10,7 +10,7 @@ The intended use case is **synthesizable real-world rings**: predict strain (inc
 
 ## Known limitations: extreme crowding
 
-The homodesmotic ring-opening reference becomes unphysical for **all-substituted small rings** where every ring carbon carries multiple non-H substituents. Examples observed in `issue.txt` (DeepSeek gradient-pressure test):
+The homodesmotic ring-opening reference becomes unphysical for **all-substituted small rings** where every ring carbon carries multiple non-H substituents. Examples observed during gradient-pressure testing:
 
 - 1,1,2,2-tetraethylcyclopropane: model +28.16 kcal/mol — calibrated strain order vs the methyl analog inverted.
 - hexamethylcyclopropane: model +27.41 kcal/mol — qualitatively below tetra-tert-butyl despite stronger crowding.
@@ -43,7 +43,7 @@ python -m cli.main --benchmark
 python scripts/derive_calibration.py
 ```
 
-CLI knobs that materially change results: `--n-conformers` (default 200), `--mc-steps` (default 500), `--no-monte-carlo` (disables MC/PT for substituted rings — see "Conformer sampling contract" below).
+CLI knobs that materially change results: `--n-conformers` (default 200), `--mc-steps` (default 500), `--seed` (default 42), `--threshold` (default 8.0), `--no-monte-carlo` (disables MC/PT for substituted rings — see "Conformer sampling contract" below).
 
 ## Tests
 
@@ -57,13 +57,36 @@ python -m pytest tests/test_regression.py::TestCycloalkaneStrain::test_cycloalka
 
 `tests/test_bulky_benchmark.py` is skipped by default; set `RUN_BENCHMARKS=1` to run it. The core cycloalkane regression uses a ±5 kcal/mol tolerance vs literature; the bulky benchmark uses ±2.5 kcal/mol.
 
+## Scripts
+
+```bash
+# Derivation: regenerate calibration coefficients from reference set (~10-15 min)
+python scripts/derive_calibration.py
+
+# Validation: held-out generalization — 8 real-world compounds NOT in reference DB
+python scripts/test_heldout_generalization.py
+
+# Validation: cis/trans cyclic-energy gap on 1,2/1,3/1,4-dimethylcyclohexane
+python scripts/verify_stereo_gap.py
+
+# Validation: real-world monosubstituted strain accuracy + stereo gap
+python scripts/validate_real_world.py
+
+# Diagnostic: trace homodesmotic ring-opening for cis/trans pairs
+python scripts/diag_homodesmotic.py
+```
+
+## Examples
+
+`examples/basic_usage.py` demonstrates the API: single-molecule analysis, cycloalkane series, steric effects, unsupported inputs, and pairwise comparison. Run with `python examples/basic_usage.py`.
+
 ## Architecture
 
 `StrainAnalyzer.analyze(smiles)` in `ring_strain/core.py` is the single entry point; everything else is a collaborator it instantiates. The pipeline is:
 
 1. **Parse + stereo enumeration** (`core._maybe_enumerate_stereo`) — if the SMILES has ≥2 unassigned ring stereocenters (e.g. 1,3-di-tert-butyl-cyclohexane without `@` markers), `EnumerateStereoisomers` is invoked, `analyze` recurses on each canonical isomer, and the lowest-strain report is returned with `strain_range_kcal_mol = (min, max)` and `stereoisomers_analyzed` attached. The recursion terminates because enumerated isomers have stereo fully assigned. The report additionally exposes `stereoisomer_breakdown` (per-isomer SMILES + calibrated + raw + cyclic energy) and `stereoisomer_cyclic_gap_kcal_mol` (max−min of the raw MMFF cyclic energy across diastereomers). **The cyclic-energy gap is the force-field-native cis/trans discrimination metric** — it bypasses the acyclic reference and per-size calibration, both of which can compress small isomer differences when the size-N calibration slope is well below 1. Use this field when reporting stereo gaps; use `total_strain_calibrated_kcal_mol` for absolute strain comparisons.
 2. **Ring validation** (`ring_analysis.RingAnalyzer.validate`) — rejects everything outside monocyclic saturated carbocycles.
-3. **Cyclic conformer search** (`mmff.MMFFCalculator`) — ETKDG embed + MMFF94 optimize all conformers in parallel. For substituted 4–7 rings, `seed_ring_pucker_conformers` then adds extra random-coords ETKDG seeds (`useRandomCoords=True`, `clearConfs=False`) so chair / twist-boat / envelope / half-chair basins are all sampled. PT + MC torsion search follows, with step counts and conformer count scaling on `compute_bulk_score(mol)`. Cluster + Boltzmann-average the surviving conformers when `use_boltzmann=True`.
+3. **Cyclic conformer search** (`mmff.MMFFCalculator`) — ETKDG embed + MMFF94 optimize all conformers in parallel, with an adaptive conformer count that scales on rotatable bonds and `compute_bulk_score(mol)` (see sampling contract below). For substituted 4–7 rings, `seed_ring_pucker_conformers` then adds extra random-coords ETKDG seeds (`useRandomCoords=True`, `clearConfs=False`) so chair / twist-boat / envelope / half-chair basins are all sampled. PT + MC torsion search follows, with step counts also scaling on bulk. Cluster + Boltzmann-average the surviving conformers when `use_boltzmann=True`.
 4. **Strain calculation** (`homodesmotic.HomodesmoticAnalyzer.compute_strain`) — two regimes:
    - **Unsubstituted cycloalkanes**: strict bond-balanced reaction `cyclo-(CH₂)ₙ + CH₃CH₃ → CH₃(CH₂)ₙ₊₁CH₃`. Per-ring-size strain is cached at `_CYCLOALKANE_STRAIN_CACHE`.
    - **Substituted**: ring opening at every single ring bond, with canonical-SMILES deduplication so symmetric rings don't pay for equivalent openings. Each unique candidate runs through the full embed + MMFF + (bulk-scaled) PT/MC + Boltzmann pipeline; the lowest-energy acyclic reference is kept.
@@ -82,11 +105,11 @@ For **substituted** rings, the Monte Carlo + parallel-tempering torsion search i
 - Conformer IDs are not guaranteed to be sequential — iterate `[c.GetId() for c in mol.GetConformers()]` rather than `range(mol.GetNumConformers())`, otherwise RDKit raises "Bad Conformer Id" once a prior PT pass has removed and re-added conformers.
 - If a substituted ring reports `~0 kcal/mol` strain, suspect the sampling before the force field.
 
-Step counts and PT temperature ladders scale with `compute_bulk_score(mol) = Σ max(1, heavy_degree − 1)²` over non-ring heavy atoms, capped at 15. The cyclic side uses `pt_steps = 100 + 12 * bulk`, `mc_steps = mc_steps_arg + 18 * bulk`; the acyclic side mirrors this so neither pool gets a sampling advantage that would bias `cyclic_E − acyclic_E`. PT runs with four replicas at (300, 500, 1000, 2000) K. Heavy-atom pre-screening uses `_VDW_CLASH_THRESHOLD_A = 1.3` Å before each MMFF call inside MC/PT steps, rejecting moves that drove non-bonded atoms into covalent-bond range.
+Step counts and PT temperature ladders scale with `compute_bulk_score(mol) = Σ max(1, heavy_degree − 1)²` over non-ring heavy atoms, capped at 15. The cyclic side uses `pt_steps = max(100, mc_steps // 4) + 12 * bulk`, `mc_steps = mc_steps_arg + 18 * bulk`; the acyclic side uses `pt_steps = 150 + 12 * bulk`, `mc_steps = 200 + 18 * bulk` — close enough that neither pool gets a systematic sampling advantage that would bias `cyclic_E − acyclic_E`. PT runs with four replicas at (300, 500, 1000, 2000) K. Initial ETKDG conformer count is also adaptive: `30 + 20 * rotatable_bonds + 15 * bulk`, clamped to `[20, max(n_conformers, 1500)]`. Heavy-atom pre-screening uses `_VDW_CLASH_THRESHOLD_A = 1.3` Å before each MMFF call inside MC/PT steps, rejecting moves that drove non-bonded atoms into covalent-bond range.
 
 ## Calibration coefficients
 
-`ring_strain/calibration_coefficients.json` is generated by `scripts/derive_calibration.py` and committed to the repo so user-facing init is sub-millisecond. The JSON carries both the fitted `(a, b)` per ring size and the raw `(raw, exp)` data points used to fit them. Regenerate it whenever `ring_strain/reference.py` changes. The script takes ~10–15 minutes because it runs the full production pipeline on every reference (including the 8 substituted compounds, each of which costs 30–90 s).
+`ring_strain/calibration_coefficients.json` is generated by `scripts/derive_calibration.py` and committed to the repo so user-facing init is sub-millisecond. The JSON carries both the fitted `(a, b)` per ring size and the raw `(raw, exp)` data points used to fit them. Regenerate it whenever `ring_strain/reference.py` changes. The script takes ~10–15 minutes because it runs the full production pipeline on every reference (including the 14 substituted compounds, each of which costs 30–90 s).
 
 The `StrainCalibrator` load order:
 1. Class-level cache from a previous call in this process.
