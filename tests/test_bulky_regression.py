@@ -17,9 +17,12 @@ import math
 import pytest
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from rdkit.Chem.rdMolDescriptors import CalcMolFormula
 
 from ring_strain.mmff import MMFFCalculator
 from ring_strain.core import StrainAnalyzer
+from ring_strain.homodesmotic import HomodesmoticAnalyzer
+from ring_strain.ring_analysis import RingAnalyzer
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +66,19 @@ class TestMMFFDecomposition:
         # Chair has gauche-staggered carbons; vdW > 0 from 1,4 repulsions.
         assert d["vdw"] > 1.0
 
+    def test_boltzmann_energy_is_not_conformer_free_energy(self):
+        """Conformer averaging must not add a degeneracy entropy bonus."""
+        calc = MMFFCalculator(n_conformers=20)
+        result = calc.embed_and_optimize(Chem.MolFromSmiles("CCCC"))
+        mol = result.molecule
+        energies = [
+            calc.compute_single_point_energy(mol, conf_id=conf.GetId())
+            for conf in mol.GetConformers()
+        ]
+        ensemble_energy = calc.compute_boltzmann_energy(mol)
+
+        assert min(energies) <= ensemble_energy <= max(energies)
+
 
 # ---------------------------------------------------------------------------
 # Bulk score
@@ -81,6 +97,31 @@ class TestBulkScore:
     def test_bulk_score(self, smiles, expected):
         mol = Chem.MolFromSmiles(smiles)
         assert MMFFCalculator.compute_bulk_score(mol) == expected
+
+
+# ---------------------------------------------------------------------------
+# Homodesmotic acyclic references
+# ---------------------------------------------------------------------------
+
+class TestAcyclicReferenceConstruction:
+    """Ring opening must produce saturated closed-shell alkane references."""
+
+    def test_opened_substituted_ring_is_h_capped_and_closed_shell(self):
+        smiles = "CC(C)[C@H]1CC[C@H](C(C)(C)C)CC1"
+        mol = Chem.MolFromSmiles(smiles)
+        ring_info = RingAnalyzer(mol).validate()[2]
+        homo = HomodesmoticAnalyzer(MMFFCalculator(n_conformers=10))
+
+        candidates = homo._build_all_acyclic_references(Chem.Mol(mol), ring_info)
+
+        assert candidates
+        assert CalcMolFormula(mol) == "C13H26"
+        for acyclic, _ in candidates:
+            assert CalcMolFormula(acyclic) == "C13H28"
+            assert all(
+                atom.GetNumRadicalElectrons() == 0
+                for atom in acyclic.GetAtoms()
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +147,11 @@ class TestStereoEnumeration:
         rep = analyzer.analyze("CC(C)(C)[C@H]1CCC[C@H](C(C)(C)C)C1")
         assert rep.strain_range_kcal_mol is None
         assert rep.stereoisomers_analyzed is None
+
+    def test_lowest_cyclic_stereoisomer_sets_zero_baseline(self, analyzer):
+        """Low-strain all-equatorial cyclohexane stereoisomers define baseline."""
+        rep = analyzer.analyze("CC(C)[C@H]1CC[C@H](C(C)(C)C)CC1")
+        assert rep.total_strain_calibrated_kcal_mol == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------

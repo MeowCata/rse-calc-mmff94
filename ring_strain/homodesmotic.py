@@ -6,10 +6,8 @@ For unsubstituted cycloalkanes, uses the strict bond-balanced reaction:
 
 For substituted cycloalkanes, uses ring-opening with H-capping:
     strain = E(cyclic) - E(acyclic_H_capped)
-The ring bond chosen for opening is the one connecting the two most-
-substituted ring atoms, so the resulting acyclic chain places bulky
-substituents far apart (avoiding artificial steric clashes that strict
-CH3-capping would introduce when caps sit next to bulky groups).
+Every single ring bond is opened and deduplicated by product SMILES; the
+lowest-energy closed-shell acyclic reference is retained.
 """
 
 from dataclasses import dataclass
@@ -49,11 +47,10 @@ class HomodesmoticAnalyzer:
         cyclo-(CH2)n + CH3-CH3  ->  CH3-(CH2)(n+1)-CH3
       Precomputed from cycloalkane SMILES, cached by ring size.
 
-    - Substituted cycloalkanes: ring-opening with H-capping.
-      Strain = E(cyclic) - E(acyclic_H_capped).
-      The ring bond to break is selected as the one connecting the two
-      most-substituted ring atoms, so the resulting linear chain places
-      bulky substituents at opposite ends.
+    - Substituted cycloalkanes: H-capped ring-opening.  Strain = E(cyclic) -
+      E(acyclic_H_capped).  Every ring bond is tried, so the reference remains
+      general across substitution patterns instead of relying on a hand-picked
+      opening.
     """
 
     def __init__(self, mmff_calc: MMFFCalculator):
@@ -239,6 +236,7 @@ class HomodesmoticAnalyzer:
                         )
                         if mc_id >= 0 and mc_e < mc_energy:
                             mc_energy = mc_e
+                    acyclic_energy = mc_energy
                 except Exception as exc:
                     logger.warning("Acyclic MC/PT search failed: %s", exc)
 
@@ -290,7 +288,7 @@ class HomodesmoticAnalyzer:
         mol: Mol,
         ring_info: RingInfo,
     ) -> List[Tuple[Mol, int]]:
-        """Build an acyclic reference for **every** single ring bond.
+        """Build H-capped acyclic references for every single ring bond.
 
         Returns a list of ``(acyclic_mol, broken_bond_idx)`` tuples, one per
         breakable single bond in the ring.  Callers can then optimise each
@@ -315,7 +313,14 @@ class HomodesmoticAnalyzer:
                     or bond.GetEndAtomIdx() not in ring_atom_set):
                 continue
 
-            rw_mol.RemoveBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+            begin_idx = bond.GetBeginAtomIdx()
+            end_idx = bond.GetEndAtomIdx()
+            rw_mol.RemoveBond(begin_idx, end_idx)
+            for atom_idx in (begin_idx, end_idx):
+                atom = rw_mol.GetAtomWithIdx(atom_idx)
+                atom.SetNoImplicit(False)
+                atom.SetNumRadicalElectrons(0)
+            rw_mol.UpdatePropertyCache(strict=False)
             try:
                 Chem.SanitizeMol(rw_mol)
             except Exception as exc:
@@ -325,6 +330,13 @@ class HomodesmoticAnalyzer:
                 )
                 continue
             acyclic_mol = rw_mol.GetMol()
+            Chem.AssignStereochemistry(acyclic_mol, force=True, cleanIt=True)
+            if any(atom.GetNumRadicalElectrons() for atom in acyclic_mol.GetAtoms()):
+                logger.warning(
+                    "Skipping radical acyclic ref after opening ring bond %d.",
+                    bidx,
+                )
+                continue
             try:
                 can = Chem.MolToSmiles(acyclic_mol, canonical=True)
             except Exception:
@@ -341,6 +353,15 @@ class HomodesmoticAnalyzer:
                 % ring_info.size,
             )
         return results
+
+    def _get_ethane_energy(self) -> float:
+        """Return cached MMFF94 energy for the ethane auxiliary reactant."""
+        global _ETHANE_ENERGY
+        if _ETHANE_ENERGY is None:
+            ethane_mol = Chem.MolFromSmiles("CC")
+            ethane_result = self.mmff.embed_and_optimize(ethane_mol)
+            _ETHANE_ENERGY = ethane_result.total_energy
+        return _ETHANE_ENERGY
 
     @staticmethod
     def _choose_bond_to_break(rw_mol, ring_info: RingInfo) -> Optional[int]:

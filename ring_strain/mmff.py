@@ -182,16 +182,20 @@ class MMFFCalculator:
         temperature: float = 298.15,
         energy_window_kcal: float = 10.0,
     ) -> float:
-        """Compute Boltzmann-weighted free energy across all conformers.
+        """Compute Boltzmann-weighted internal energy across conformers.
 
-            E_thermal = -RT * ln( sum_i exp(-(E_i - E_min) / RT) ) + E_min
+            <E> = sum_i E_i * exp(-(E_i - E_min) / RT) / sum_i weight_i
 
         Conformers more than ``energy_window_kcal`` above the minimum are
         skipped (negligible weight at room temperature).
 
-        This is the thermodynamically correct quantity for strain
-        calculation when the molecule has multiple low-lying conformers,
-        which is exactly the situation for bulky substituted rings.
+        Ring strain is defined here for the sampled potential-energy
+        ensemble, not as a conformational free energy. Using
+        ``E_min - RT ln(Z)`` would reward molecules with more conformer
+        degeneracy; open-chain references usually have many more rotamers
+        than cyclic structures, which artificially lowers the acyclic
+        baseline and inflates strain for otherwise strain-free trans
+        cyclohexane chairs.
         """
         import math as _math
 
@@ -221,16 +225,19 @@ class MMFFCalculator:
 
         e_min = min(energies)
         partition = 0.0
+        weighted_energy = 0.0
         for e in energies:
             de = e - e_min
             if de > energy_window_kcal:
                 continue
-            partition += _math.exp(-de / RT)
+            weight = _math.exp(-de / RT)
+            partition += weight
+            weighted_energy += e * weight
 
         if partition <= 0:
             return e_min
 
-        return e_min - RT * _math.log(partition)
+        return weighted_energy / partition
 
     def generate_conformers(
         self, mol: Mol, n_conformers: Optional[int] = None

@@ -538,6 +538,14 @@ class StrainAnalyzer:
 
         # --- Step 4: Calibrate ---
         calibrated = self.calibrator.calibrate(raw_strain, ring_info.size)
+        stereo_baseline = self._stereo_minimum_baseline(
+            mol,
+            ring_info,
+            current_cyclic_energy=components.get("cyclic_energy"),
+            current_calibrated=calibrated,
+        )
+        if stereo_baseline is not None:
+            calibrated = stereo_baseline
         uncertainty = self.calibrator.estimate_uncertainty(ring_info.size)
         if is_substituted:
             uncertainty += 1.5
@@ -794,6 +802,155 @@ class StrainAnalyzer:
             f"(min, max) range across all."
         ]
         return primary
+
+    def _stereo_minimum_baseline(
+        self,
+        mol: Mol,
+        ring_info: RingInfo,
+        current_cyclic_energy: Optional[float],
+        current_calibrated: float,
+    ) -> Optional[float]:
+        """Zero low-strain stereochemical baselines for substituted rings.
+
+        Homodesmotic opening measures the cost of a ring relative to an open
+        chain, but for flexible substituted cyclohexanes it can leave a small
+        residual for the lowest-energy all-equatorial stereoisomer. When the
+        current explicit isomer is the cyclic-energy minimum among the
+        molecule's diastereomers, that residual is a reference artifact rather
+        than ring strain. The cyclic-energy spread itself remains available as
+        the stereochemical penalty for higher-energy isomers.
+        """
+        if current_cyclic_energy is None:
+            return None
+        if current_calibrated < 0.0 or current_calibrated > 3.0:
+            return None
+        if mol.GetNumHeavyAtoms() <= ring_info.size:
+            return None
+
+        try:
+            centers = Chem.FindMolChiralCenters(
+                mol, includeUnassigned=True, useLegacyImplementation=False,
+            )
+        except Exception:
+            return None
+
+        ring_atom_set = set(ring_info.atom_indices)
+        assigned_ring_centers = [
+            idx for idx, label in centers
+            if idx in ring_atom_set and label != "?"
+        ]
+        if len(assigned_ring_centers) < 2:
+            return None
+
+        try:
+            from rdkit.Chem.EnumerateStereoisomers import (
+                EnumerateStereoisomers, StereoEnumerationOptions,
+            )
+        except ImportError:
+            return None
+
+        opts = StereoEnumerationOptions(
+            onlyUnassigned=False, unique=True, maxIsomers=8,
+        )
+        try:
+            isomers = list(EnumerateStereoisomers(mol, options=opts))
+        except Exception:
+            return None
+        if len(isomers) < 2:
+            return None
+
+        current_smiles = Chem.MolToSmiles(
+            mol, canonical=True, isomericSmiles=True,
+        )
+        energies = {current_smiles: float(current_cyclic_energy)}
+        for iso in isomers:
+            iso_smiles = Chem.MolToSmiles(
+                iso, canonical=True, isomericSmiles=True,
+            )
+            if iso_smiles in energies:
+                continue
+            try:
+                energies[iso_smiles] = self._compute_cyclic_energy_only(
+                    Chem.Mol(iso), ring_info,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Stereo baseline cyclic-energy probe failed for %s: %s",
+                    iso_smiles, exc,
+                )
+
+        finite = [e for e in energies.values() if e == e]
+        if len(finite) < 2:
+            return None
+        min_energy = min(finite)
+        if float(current_cyclic_energy) - min_energy <= 0.25:
+            return 0.0
+        return None
+
+    def _compute_cyclic_energy_only(
+        self,
+        mol: Mol,
+        ring_info: RingInfo,
+    ) -> float:
+        """Compute the cyclic-side energy with the production sampling path."""
+        cyclic_result = self.mmff_calc.embed_and_optimize(Chem.Mol(mol))
+        cyclic_mol = cyclic_result.molecule
+        best_conf_id = cyclic_result.best_conf_id
+
+        if mol.GetNumHeavyAtoms() > ring_info.size and 4 <= ring_info.size <= 7:
+            try:
+                self.mmff_calc.seed_ring_pucker_conformers(
+                    cyclic_mol,
+                    ring_info.atom_indices,
+                )
+            except Exception as exc:
+                logger.debug("Ring puckering probe failed: %s", exc)
+
+        if mol.GetNumHeavyAtoms() > ring_info.size and self.use_monte_carlo:
+            try:
+                bulk = min(15, self.mmff_calc.compute_bulk_score(cyclic_mol))
+                pt_steps = max(100, self.mc_steps // 4) + 12 * bulk
+                mc_steps_eff = self.mc_steps + 18 * bulk
+                pt_temps = (300.0, 500.0, 1000.0, 2000.0)
+                if self.use_parallel_tempering:
+                    mc_best_id, _ = self.mmff_calc.parallel_tempering_search(
+                        cyclic_mol,
+                        n_steps=pt_steps,
+                        temperatures=pt_temps,
+                    )
+                else:
+                    mc_best_id, _ = self.mmff_calc.monte_carlo_search(
+                        cyclic_mol, n_steps=mc_steps_eff,
+                    )
+                if mc_best_id >= 0:
+                    best_conf_id = mc_best_id
+            except Exception as exc:
+                logger.debug("Stereo baseline MC/PT probe failed: %s", exc)
+
+        if self.use_boltzmann and mol.GetNumHeavyAtoms() > ring_info.size:
+            try:
+                kept = self.mmff_calc.cluster_conformers(
+                    cyclic_mol,
+                    rmsd_threshold=0.5,
+                    energy_window_kcal=8.0,
+                )
+                if len(kept) >= 2:
+                    keep_confs = [
+                        Chem.Conformer(cyclic_mol.GetConformer(c))
+                        for c in kept
+                    ]
+                    cyclic_mol.RemoveAllConformers()
+                    for c in keep_confs:
+                        cyclic_mol.AddConformer(c, assignId=True)
+                    return self.mmff_calc.compute_boltzmann_energy(
+                        cyclic_mol, temperature=298.15,
+                    )
+            except Exception as exc:
+                logger.debug("Stereo baseline Boltzmann probe failed: %s", exc)
+
+        return self.mmff_calc.compute_single_point_energy(
+            cyclic_mol, conf_id=best_conf_id,
+        )
 
     def _not_supported_report(
         self, smiles: str, mol: Mol, message: str
