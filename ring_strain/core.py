@@ -183,7 +183,7 @@ class StrainReport:
         lines.append(f"  Strain per heavy atom:   {self.strain_per_heavy_atom_kcal_mol:+.3f} kcal/mol")
         lines.append(f"  Uncertainty:             +/- {self.calibration_uncertainty:.1f} kcal/mol")
         lines.append("")
-        lines.append(f"  Strain score:      {self.stability_score:.1f} / 100  ({self.stability_category})")
+        lines.append(f"  Strain score(higher is more stable):      {self.stability_score:.1f} / 100  ({self.stability_category})")
 
         if self.reference_match:
             lines.append("")
@@ -222,10 +222,10 @@ class StrainReport:
 
         # MMFF94 per-term decomposition of cyclic - acyclic energies.
         decomp_fields = (
-            ("vdw_strain_kcal_mol",     "vdW (true steric):    "),
-            ("torsion_strain_kcal_mol", "Torsion (Pitzer):     "),
-            ("angle_strain_kcal_mol",   "Angle (Baeyer):       "),
-            ("bond_strain_kcal_mol",    "Bond stretch:         "),
+            ("vdw_strain_kcal_mol",     "vdW ΔE:    "),
+            ("torsion_strain_kcal_mol", "Torsion ΔE:     "),
+            ("angle_strain_kcal_mol",   "Angle ΔE:       "),
+            ("bond_strain_kcal_mol",    "Bond stretch ΔE:         "),
         )
         if any(getattr(self, f) is not None for f, _ in decomp_fields):
             lines.append("")

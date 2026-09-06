@@ -1,5 +1,4 @@
-# ver.rse-calc-0707
-
+# run-results
 ============================================================
   Ring Strain Analysis: C[C@H]1CC[C@@H](C)CC1   ============================================================                                      Formula:           C8H16
   Molecular weight:  112.22 g/mol                 Heavy atoms:       8
@@ -108,39 +107,64 @@
 
 
 
-===========================================================
-  Ring Strain Analysis: C1CCC1C
+=========================================================
+  Ring Strain Analysis: C1CCCCCCCCCC1
 ============================================================
-  Formula:           C5H10
-  Molecular weight:  70.14 g/mol
-  Heavy atoms:       5
-  Ring size:         4-membered
-  Ring type:          monocyclic saturated carbocycle (substituted)
+  Formula:           C11H22
+  Molecular weight:  154.30 g/mol
+  Heavy atoms:       11
+  Ring size:         11-membered
+  Ring type:          monocyclic saturated carbocycle
   Monte Carlo search: no
 
-  Raw MMFF94 strain:       +16.90 kcal/mol
-  Calibrated strain:       +27.12 kcal/mol
-  Strain per heavy atom:   +5.424 kcal/mol
-  Uncertainty:             +/- 4.0 kcal/mol
+  Raw MMFF94 strain:       +22.07 kcal/mol
+  Calibrated strain:       +12.14 kcal/mol
+  Strain per heavy atom:   +1.104 kcal/mol
+  Uncertainty:             +/- 3.0 kcal/mol
 
-  Strain score:      3.4 / 100  (highly strained)
-
-  Reference match: methylcyclobutane
-    Computed:  27.12 kcal/mol
-    Reference: 26.7 kcal/mol
+  Strain score:      21.9 / 100  (significant strain)
 
   --- Geometry Decomposition ---
-  Baeyer (angle) RMS:     22.3 deg
-  Pitzer (torsion) eclipsed: 0
-  Steric confinement:     -0.25 kcal/mol
+  Baeyer (angle) RMS:     5.8 deg
+  Pitzer (torsion) eclipsed: 1
+  Steric confinement:     +3.73 kcal/mol
 
   --- MMFF94 Energy Decomposition (cyclic - acyclic) ---
-  vdW (true steric):     -0.25 kcal/mol
-  Torsion (Pitzer):      +16.24 kcal/mol
-  Angle (Baeyer):        +1.21 kcal/mol
-  Bond stretch:          +0.15 kcal/mol
+  vdW (true steric):     +3.73 kcal/mol
+  Torsion (Pitzer):      +8.26 kcal/mol
+  Angle (Baeyer):        +9.91 kcal/mol
+  Bond stretch:          +1.04 kcal/mol
 ============================================================
 
+
+=============
+  Ring Strain Analysis: C1CCCCCCCCCCCC1
+============================================================
+  Formula:           C13H26
+  Molecular weight:  182.35 g/mol
+  Heavy atoms:       13
+  Ring size:         13-membered
+  Ring type:          monocyclic saturated carbocycle
+  Monte Carlo search: no
+
+  Raw MMFF94 strain:       +16.11 kcal/mol
+  Calibrated strain:       +8.87 kcal/mol
+  Strain per heavy atom:   +0.682 kcal/mol
+  Uncertainty:             +/- 3.0 kcal/mol
+
+  Strain score:      33.0 / 100  (moderate strain)
+
+  --- Geometry Decomposition ---
+  Baeyer (angle) RMS:     4.2 deg
+  Pitzer (torsion) eclipsed: 1
+  Steric confinement:     +4.20 kcal/mol
+
+  --- MMFF94 Energy Decomposition (cyclic - acyclic) ---
+  vdW (true steric):     +4.20 kcal/mol
+  Torsion (Pitzer):      +6.52 kcal/mol
+  Angle (Baeyer):        +5.07 kcal/mol
+  Bond stretch:          +1.29 kcal/mol
+============================================================
 
 
 ========================================================
