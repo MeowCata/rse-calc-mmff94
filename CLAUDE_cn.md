@@ -43,7 +43,7 @@ python -m cli.main --benchmark
 python scripts/derive_calibration.py
 ```
 
-会显著影响结果的 CLI 参数：`--n-conformers`（默认 200）、`--mc-steps`（默认 500）、`--seed`（默认 42）、`--threshold`（默认 8.0）、`--no-monte-carlo`（禁用取代环的 MC/PT——见下文"构象采样约定"）。
+会显著影响结果的 CLI 参数：`--n-conformers`（默认 200）、`--mc-steps`（默认 500）、`--seed`（默认 42）、`--threshold`（默认 8.0）、`--no-monte-carlo`（禁用取代环的 MC/PT——见下文"构象采样约定"）。CLI 默认在 stderr 显示进度；`--no-progress` 可关闭进度，且不会改变结果或 JSON stdout。
 
 ## 测试
 
@@ -90,11 +90,13 @@ python scripts/diag_homodesmotic.py
 4. **张力计算**（`homodesmotic.HomodesmoticAnalyzer.compute_strain`）——两种模式：
    - **未取代环烷烃**：严格的键平衡反应 `环-(CH₂)ₙ + CH₃CH₃ → CH₃(CH₂)ₙ₊₁CH₃`。每个环大小的张力缓存在 `_CYCLOALKANE_STRAIN_CACHE` 中。
    - **取代环**：在每个环单键处开环，通过规范 SMILES 去重，使对称环不会为等效的开环位置付出重复计算代价。每个唯一候选结构运行完整的嵌入 + MMFF +（体积缩放的）PT/MC + 玻尔兹曼流程；保留能量最低的开链参比。
-5. **各能量项分解**——`MMFFCalculator.decompose_energy` 通过切换 `SetMMFFXxxTerm(False)` 来提取环状和开链结构的 `{bond, angle, stretch_bend, oop, torsion, vdw, electrostatic}`；环状减开链的差值填充 `StrainReport` 上的 `vdw_strain_kcal_mol / torsion_strain_kcal_mol / angle_strain_kcal_mol / bond_strain_kcal_mol`。**vdW 差值是有物理意义的"真实空间位阻"张力**，也是现在 `steric_confinement_kcal_mol` 报告的值。
+5. **聚焦诊断**——`GeometryAnalyzer` 报告不依赖力场的 Baeyer 键角 RMS，并通过相邻键投影统计具有重叠构象的环键作为 Pitzer 指标。`MMFFCalculator.compute_vdw_energy` 只提取环状与开链代表构象的 vdW 贡献，两者之差通过 `steric_confinement_kcal_mol` 暴露。原有公开的 MMFF94 键长/键角/扭转/vdW 分项字段不再报告。
 6. **标定**（`calibrate.StrainCalibrator`）——按环大小的线性校正 `calibrated = a[size] * raw + b[size]`，从 `ring_strain/calibration_coefficients.json` 加载以实现即时初始化。对于未取代参比定义了无张力锚点的环大小（尤其是环己烷 = 0），拟合被约束为精确通过 `(raw_anchor, 0)`。只有一个参比的环大小回退到历史乘法形式。在编辑参考集合后如需重新生成，运行 `python scripts/derive_calibration.py`。
 7. **评分 / 参考匹配**——`scoring.StabilityScorer` 将标定后的张力映射为 0–100 分（默认阈值 8 kcal/mol）；`reference.ReferenceDatabase` 按规范 SMILES 查询。
 
-几何诊断（`geometry.GeometryAnalyzer`）与能量路径并行运行，在报告中贡献 Baeyer（角度 RMS）、Pitzer（重叠扭转计数）和跨环接触字段——它们来自单个最佳构象的诊断快照，**当玻尔兹曼平均处于活跃状态时，不能保证各项之和等于 `total_strain_mmff_kcal_mol`**。同样的注意事项适用于各能量项分解。
+几何诊断（`geometry.GeometryAnalyzer`）与能量路径一同运行，在报告中提供 Baeyer（角度 RMS）、Pitzer（重叠环键计数）和跨环接触字段；这些值来自单个最佳构象的几何快照。`steric_confinement_kcal_mol` 同样是代表构象的 vdW 差值，不应被期望等于玻尔兹曼平均后的总应变。
+
+长时间分析可通过 `StrainAnalyzer(..., progress_callback=...)` 的默认回调或每次调用的 `analyze(..., progress_callback=...)` 覆盖回调发出结构化 `ProgressUpdate` 事件。事件包含当前任务、单调递增的总体进度、局部计数、SMILES 与已用时间；嵌套的立体异构体分析共享根计时器。每个返回的 `StrainReport` 都包含 `elapsed_time_seconds`，CLI 将进度保留在 stderr，从而保证 `--json` 的 stdout 可被机器解析。
 
 ## 构象采样约定（关键）
 

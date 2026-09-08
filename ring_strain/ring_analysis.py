@@ -49,7 +49,12 @@ class RingAnalyzer:
                 f"({len(sssr)} rings detected; only monocyclic supported)"
             ), None
 
-        ring_atoms = tuple(sorted(sssr[0]))
+        # Geometry consumers require cyclic topological order. Atom indices
+        # reflect SMILES construction order, so sorting them can place
+        # non-bonded atoms next to one another for branched SMILES.
+        ring_atoms = _order_ring_atoms(tuple(sssr[0]), self.mol)
+        if ring_atoms is None:
+            return False, "Not Supported: invalid monocyclic ring topology", None
         size = len(ring_atoms)
 
         # All ring atoms must be carbon
@@ -63,6 +68,8 @@ class RingAnalyzer:
 
         # All ring bonds must be single bonds (no double/triple/aromatic)
         ring_bonds = _get_ring_bonds(ring_atoms, self.mol)
+        if len(ring_bonds) != size:
+            return False, "Not Supported: invalid monocyclic ring topology", None
         for bidx in ring_bonds:
             bond = self.mol.GetBondWithIdx(bidx)
             if bond.GetBondType() != rdchem.BondType.SINGLE:
@@ -80,6 +87,46 @@ class RingAnalyzer:
 
     def has_rings(self) -> bool:
         return Chem.GetSymmSSSR(self.mol).__len__() > 0
+
+
+def _order_ring_atoms(
+    ring_atoms: Tuple[int, ...], mol: Mol
+) -> Optional[Tuple[int, ...]]:
+    """Return a deterministic bond-by-bond traversal of a simple ring."""
+    ring_set = set(ring_atoms)
+    if len(ring_set) < 3:
+        return None
+
+    ring_neighbors = {
+        idx: sorted(
+            neighbor.GetIdx()
+            for neighbor in mol.GetAtomWithIdx(idx).GetNeighbors()
+            if neighbor.GetIdx() in ring_set
+        )
+        for idx in ring_set
+    }
+    if any(len(neighbors) != 2 for neighbors in ring_neighbors.values()):
+        return None
+
+    start = min(ring_set)
+    ordered = [start]
+    previous = None
+    current = start
+    while len(ordered) < len(ring_set):
+        candidates = [
+            idx for idx in ring_neighbors[current]
+            if idx != previous and idx not in ordered
+        ]
+        if not candidates:
+            return None
+        next_idx = candidates[0]
+        ordered.append(next_idx)
+        previous, current = current, next_idx
+
+    if start not in ring_neighbors[current]:
+        return None
+    return tuple(ordered)
+
 
 def _get_ring_bonds(ring_atoms: Tuple[int, ...], mol: Mol) -> List[int]:
     """Get bond indices for bonds within a ring."""

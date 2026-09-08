@@ -1,8 +1,8 @@
 """Regression tests for the bulky-substituent accuracy refactor.
 
 These tests focus on the new infrastructure introduced in the
-``frolicking-coalescing-crescent`` plan: MMFF94 per-term decomposition,
-ring-puckering seeds, bulk-aware sampling budget, vdW pre-screen, and
+``frolicking-coalescing-crescent`` plan: vdW confinement diagnostics,
+ring-puckering seeds, bulk-aware sampling budget, clash pre-screen, and
 stereochemistry enumeration. They run quickly (no full strain pipeline
 on every reference compound) so they can run as part of the standard
 test suite.
@@ -13,7 +13,6 @@ each bulky reference takes 30-90 seconds under the new bulk-aware
 sampling depth.
 """
 
-import math
 import pytest
 from rdkit import Chem
 from rdkit.Chem import AllChem
@@ -23,14 +22,15 @@ from ring_strain.mmff import MMFFCalculator
 from ring_strain.core import StrainAnalyzer
 from ring_strain.homodesmotic import HomodesmoticAnalyzer
 from ring_strain.ring_analysis import RingAnalyzer
+from ring_strain.geometry import GeometryAnalyzer
 
 
 # ---------------------------------------------------------------------------
-# MMFF94 term decomposition
+# MMFF94 vdW confinement term
 # ---------------------------------------------------------------------------
 
-class TestMMFFDecomposition:
-    """Verify decompose_energy isolates each MMFF94 term correctly."""
+class TestMMFFVdwEnergy:
+    """Verify the retained vdW-only diagnostic."""
 
     def _embed_and_optimize(self, smiles):
         mol = Chem.MolFromSmiles(smiles)
@@ -39,32 +39,11 @@ class TestMMFFDecomposition:
         AllChem.MMFFOptimizeMolecule(mol)
         return mol
 
-    def test_decomposition_returns_all_terms(self):
-        mol = self._embed_and_optimize("CC")
-        decomp = MMFFCalculator.decompose_energy(mol)
-        expected_keys = {
-            "total", "bond", "angle", "stretch_bend",
-            "oop", "torsion", "vdw", "electrostatic",
-        }
-        assert expected_keys <= set(decomp.keys())
-
-    def test_terms_sum_to_total(self):
-        mol = self._embed_and_optimize("C1CCCCC1")
-        d = MMFFCalculator.decompose_energy(mol)
-        # All non-total terms should sum to total within numerical tolerance.
-        # MMFF94 terms are additive in the force field.
-        components_sum = sum(
-            v for k, v in d.items()
-            if k != "total" and v == v  # skip NaN
-        )
-        assert math.isclose(components_sum, d["total"], abs_tol=0.05)
-
     def test_cyclohexane_vdw_nontrivial(self):
         """Cyclohexane chair has measurable vdW contribution."""
         mol = self._embed_and_optimize("C1CCCCC1")
-        d = MMFFCalculator.decompose_energy(mol)
         # Chair has gauche-staggered carbons; vdW > 0 from 1,4 repulsions.
-        assert d["vdw"] > 1.0
+        assert MMFFCalculator.compute_vdw_energy(mol) > 1.0
 
     def test_boltzmann_energy_is_not_conformer_free_energy(self):
         """Conformer averaging must not add a degeneracy entropy bonus."""
@@ -78,6 +57,44 @@ class TestMMFFDecomposition:
         ensemble_energy = calc.compute_boltzmann_energy(mol)
 
         assert min(energies) <= ensemble_energy <= max(energies)
+
+
+# ---------------------------------------------------------------------------
+# Ring topology and Pitzer geometry
+# ---------------------------------------------------------------------------
+
+class TestPitzerGeometry:
+    """Pitzer counts use real ring bonds and valid projected neighbours."""
+
+    @staticmethod
+    def _optimized(smiles):
+        mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+        assert AllChem.EmbedMolecule(mol, randomSeed=42) == 0
+        AllChem.MMFFOptimizeMolecule(mol)
+        return mol
+
+    def test_branched_smiles_ring_atoms_are_in_bond_order(self):
+        mol = Chem.MolFromSmiles("C(C1)(CCC1)")
+        valid, _, ring = RingAnalyzer(mol).validate()
+        assert valid
+        assert len(ring.bond_indices) == ring.size == 5
+        for idx, atom_idx in enumerate(ring.atom_indices):
+            next_idx = ring.atom_indices[(idx + 1) % ring.size]
+            assert mol.GetBondBetweenAtoms(atom_idx, next_idx) is not None
+
+    def test_cyclopropane_counts_three_real_eclipsed_bonds(self):
+        mol = self._optimized("C1CC1")
+        ring = RingAnalyzer(mol).validate()[2]
+        result = GeometryAnalyzer(mol).compute_torsion_strain_in_ring(
+            ring.atom_indices
+        )
+
+        assert result["n_eclipsed"] == 3
+        assert len(result["torsions"]) == ring.size
+        for torsion in result["torsions"]:
+            assert len(set(torsion["atoms"])) == 4
+            j, k = torsion["bond"]
+            assert mol.GetBondBetweenAtoms(j, k) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -155,23 +172,30 @@ class TestStereoEnumeration:
 
 
 # ---------------------------------------------------------------------------
-# Per-term strain plumbing in StrainReport
+# Retained strain diagnostics in StrainReport
 # ---------------------------------------------------------------------------
 
-class TestStrainReportDecomposition:
-    """The four new *_strain_kcal_mol fields are populated for substituted rings."""
+class TestStrainReportDiagnostics:
+    """Reports retain vdW confinement but omit per-term decomposition."""
 
     @pytest.fixture(scope="class")
     def analyzer(self):
         return StrainAnalyzer(n_conformers=30, mc_steps=80)
 
-    def test_substituted_ring_has_decomposition(self, analyzer):
-        """methylcyclopropane (substituted) gets per-term strain in report."""
+    def test_substituted_ring_has_requested_diagnostics(self, analyzer):
         rep = analyzer.analyze("CC1CC1")
-        assert rep.vdw_strain_kcal_mol is not None
-        assert rep.torsion_strain_kcal_mol is not None
-        # Cyclopropane derivatives: torsion (eclipsed) dominates strain.
-        assert abs(rep.torsion_strain_kcal_mol) > 1.0
+        assert rep.steric_confinement_kcal_mol is not None
+        assert rep.baeyer_strain_rms_deg is not None
+        assert rep.pitzer_n_eclipsed is not None
+        for removed in (
+            "vdw_strain_kcal_mol",
+            "torsion_strain_kcal_mol",
+            "angle_strain_kcal_mol",
+            "bond_strain_kcal_mol",
+        ):
+            assert not hasattr(rep, removed)
+            assert removed not in rep.to_dict()
+        assert "MMFF94 Energy Decomposition" not in rep.print_summary()
 
 
 # ---------------------------------------------------------------------------

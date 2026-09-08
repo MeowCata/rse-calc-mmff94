@@ -11,10 +11,63 @@ Usage:
 """
 
 import argparse
+from dataclasses import replace
 import json
+from pathlib import Path
 import sys
+import time
 
-from ring_strain.core import StrainAnalyzer, StrainReport
+from ring_strain.core import ProgressUpdate, StrainAnalyzer
+
+
+class _CliProgress:
+    """Render progress on stderr without contaminating result output."""
+
+    def __init__(self, stream=None):
+        self.stream = stream or sys.stderr
+        self.is_tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        self._line_width = 0
+        self._last_signature = None
+
+    def __call__(self, update: ProgressUpdate) -> None:
+        counter = ""
+        if update.current is not None and update.total is not None:
+            counter = f" ({update.current}/{update.total})"
+        line = (
+            f"[{update.percent:6.1f}%] {update.task}{counter} "
+            f"| elapsed {update.elapsed_seconds:.1f} s"
+        )
+        terminal = update.stage in {"complete", "error"}
+
+        if self.is_tty:
+            padded = line.ljust(self._line_width)
+            self._line_width = max(self._line_width, len(line))
+            print(padded, end="\n" if terminal else "\r", file=self.stream, flush=True)
+            if terminal:
+                self._line_width = 0
+            return
+
+        # Redirected logs receive stage/task transitions and 10% boundaries,
+        # avoiding one line per MC step while retaining meaningful feedback.
+        signature = (update.stage, update.task, int(update.percent // 10))
+        if terminal or signature != self._last_signature:
+            print(line, file=self.stream, flush=True)
+            self._last_signature = signature
+
+
+def _item_progress_callback(callback, index, total, label):
+    """Map one analysis into its item range for batch/benchmark progress."""
+    if callback is None:
+        return None
+
+    def report(update: ProgressUpdate) -> None:
+        callback(replace(
+            update,
+            task=f"{label} {index}/{total}: {update.task}",
+            progress=((index - 1) + update.progress) / total,
+        ))
+
+    return report
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -91,6 +144,11 @@ Examples:
         action="store_true",
         help="Run benchmark on reference compounds.",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Suppress calculation progress on stderr.",
+    )
 
     return parser
 
@@ -100,12 +158,14 @@ def main():
     args = parser.parse_args()
 
     # Initialize analyzer
+    progress_callback = None if args.no_progress else _CliProgress()
     analyzer = StrainAnalyzer(
         n_conformers=args.n_conformers,
         random_seed=args.seed,
         stability_threshold=args.threshold,
         use_monte_carlo=not args.no_monte_carlo,
         mc_steps=args.mc_steps,
+        progress_callback=progress_callback,
     )
 
     # --- List references ---
@@ -169,15 +229,21 @@ def _cmd_list_refs(analyzer: StrainAnalyzer):
 def _cmd_benchmark(analyzer: StrainAnalyzer):
     refs = analyzer.ref_db.get_all()
     results = []
+    started_at = time.perf_counter()
 
     print(f"\nBenchmark: {len(refs)} reference compounds")
     print("=" * 80)
     print(f"{'Name':<38} {'Exp':>7} {'MMFF':>7} {'Calib':>7} {'Error':>6} {'Note'}")
 
     errors = []
-    for ref in refs:
+    for index, ref in enumerate(refs, start=1):
         try:
-            report = analyzer.analyze(ref.smiles)
+            report = analyzer.analyze(
+                ref.smiles,
+                progress_callback=_item_progress_callback(
+                    analyzer.progress_callback, index, len(refs), "Benchmark"
+                ),
+            )
             error = abs(report.total_strain_calibrated_kcal_mol - ref.strain_energy_kcal_mol)
             if report.is_supported:
                 errors.append(error)
@@ -206,6 +272,11 @@ def _cmd_benchmark(analyzer: StrainAnalyzer):
         print(f"  Mean absolute error: {sum(errors)/len(errors):.2f} kcal/mol")
         print(f"  Max  absolute error: {max(errors):.2f} kcal/mol")
         print(f"  N compounds:         {len(errors)}")
+    if analyzer.progress_callback is not None:
+        print(
+            f"Benchmark completed in {time.perf_counter() - started_at:.2f} s",
+            file=sys.stderr,
+        )
 
 
 def _cmd_batch(analyzer: StrainAnalyzer, filepath: str, json_output: bool):
@@ -214,26 +285,43 @@ def _cmd_batch(analyzer: StrainAnalyzer, filepath: str, json_output: bool):
         print(f"Error: file not found: {filepath}")
         sys.exit(1)
 
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         smiles_list = [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
+    started_at = time.perf_counter()
+    total = len(smiles_list)
     if json_output:
         results = []
-        for smi in smiles_list:
+        for index, smi in enumerate(smiles_list, start=1):
             try:
-                report = analyzer.analyze(smi)
+                report = analyzer.analyze(
+                    smi,
+                    progress_callback=_item_progress_callback(
+                        analyzer.progress_callback, index, total, "Batch"
+                    ),
+                )
                 results.append(report.to_dict())
             except Exception as exc:
                 results.append({"smiles": smi, "error": str(exc)})
         print(json.dumps(results, indent=2))
     else:
-        for smi in smiles_list:
+        for index, smi in enumerate(smiles_list, start=1):
             try:
-                report = analyzer.analyze(smi)
+                report = analyzer.analyze(
+                    smi,
+                    progress_callback=_item_progress_callback(
+                        analyzer.progress_callback, index, total, "Batch"
+                    ),
+                )
                 print(report.print_summary())
                 print()
             except Exception as exc:
                 print(f"ERROR [{smi}]: {exc}\n")
+    if analyzer.progress_callback is not None:
+        print(
+            f"Batch completed in {time.perf_counter() - started_at:.2f} s",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

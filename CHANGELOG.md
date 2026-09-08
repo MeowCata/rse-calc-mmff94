@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-09-08
+
+- Removed the public MMFF94 per-term energy decomposition from reports, JSON,
+  and the CLI while retaining total/raw/calibrated strain, per-atom strain,
+  score, Baeyer RMS, Pitzer eclipsed-ring-bond counts, and vdW steric
+  confinement.
+- Added structured progress callbacks with monotonic overall progress,
+  per-analysis elapsed wall time, nested stereoisomer/candidate scopes, and a
+  CLI renderer that keeps progress on stderr (`--no-progress` disables it).
+- Corrected stereochemical baseline-search indentation and expanded acyclic
+  reference progress reporting to cover seeding, MC/PT, clustering, and
+  Boltzmann averaging.
+- Optimized MC/PT heavy-atom clash screening with vectorized coordinate access
+  without changing the clash threshold or bonded-pair exclusions.
+- Documented deferred accuracy and uncertainty improvements in
+  `improve-accu.md`.
+
 ## 2026-07-07
 
 - Fixed substituted-ring acyclic reference construction so ring-opening endpoints are saturated closed-shell carbons instead of occasional radical-like `[CH]` endpoints inherited from RDKit property state. This applies to every substituted monocyclic carbocycle opening path, with canonical-SMILES deduplication still preserved.

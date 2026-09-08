@@ -8,7 +8,7 @@ StrainReport    - Dataclass with all strain analysis results.
 
 Modules
 -------
-core           - Orchestrator (StrainAnalyzer, StrainReport)
+core           - Orchestrator, reports, and structured progress events
 mmff           - MMFF94 wrapper (embedding, optimization, energy)
 ring_analysis  - Ring detection and classification
 homodesmotic   - Homodesmotic reaction construction
@@ -18,7 +18,7 @@ reference      - Known reference compound database
 geometry       - Geometric strain decomposition
 """
 
-from .core import StrainAnalyzer, StrainReport
+from .core import ProgressUpdate, StrainAnalyzer, StrainReport
 from .reference import ReferenceDatabase, ReferenceCompound
 from .mmff import MMFFCalculator, MMFFResult
 from .scoring import StabilityScorer, StabilityCategory
@@ -26,6 +26,7 @@ from .scoring import StabilityScorer, StabilityCategory
 __all__ = [
     "StrainAnalyzer",
     "StrainReport",
+    "ProgressUpdate",
     "ReferenceDatabase",
     "ReferenceCompound",
     "MMFFCalculator",

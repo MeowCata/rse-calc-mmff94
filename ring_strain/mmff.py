@@ -5,8 +5,8 @@ Provides robust conformer embedding, multi-conformer sampling, MMFF94
 optimization, and energy computation with error handling for edge cases.
 """
 
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Tuple
 import logging
 
 from rdkit import Chem
@@ -19,6 +19,20 @@ from rdkit.Chem.rdForceFieldHelpers import (
 from rdkit.Chem.rdMolDescriptors import CalcNumHeavyAtoms
 
 logger = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[str, int, int], None]
+
+
+def _report_progress(
+    callback: Optional[ProgressCallback], task: str, current: int, total: int
+) -> None:
+    """Report local work counters; UI callback failures are non-fatal."""
+    if callback is None:
+        return
+    try:
+        callback(task, current, total)
+    except Exception as exc:
+        logger.warning("MMFF progress callback failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +74,6 @@ class MMFFResult:
     num_heavy_atoms: int
     energy_per_heavy_atom: float
     mmff_param_coverage: float            # Fraction of atoms with MMFF94 parameters
-    energy_breakdown: Dict[str, float] = field(default_factory=dict)
 
 
 class MMFFCalculator:
@@ -101,7 +114,11 @@ class MMFFCalculator:
     # Public API
     # ------------------------------------------------------------------
 
-    def embed_and_optimize(self, mol: Mol) -> MMFFResult:
+    def embed_and_optimize(
+        self,
+        mol: Mol,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> MMFFResult:
         """Full pipeline: sanitize, add H, generate conformers, MMFF94 optimize.
 
         Returns the molecule with the lowest-energy conformer and
@@ -118,7 +135,15 @@ class MMFFCalculator:
         # than flexible ones. Measure flexibility by rotatable bonds count.
         effective_n_conf = self._compute_effective_conformers(mol)
 
-        # Suppress C++ stderr noise during the conformer+optimize phase.
+        # Emit outside stderr suppression so CLI progress remains visible.
+        _report_progress(
+            progress_callback,
+            f"Generating {effective_n_conf} conformers",
+            0,
+            2,
+        )
+
+        # Suppress C++ stderr noise during conformer generation.
         # RDKit's BFGS optimizer can emit "Invariant Violation: bad
         # direction in linearSearch" directly to stderr from C++ when
         # the initial geometry is poor (e.g., cyclopentane ETKDG failure).
@@ -132,9 +157,17 @@ class MMFFCalculator:
                     f"{n_heavy} heavy atoms."
                 )
 
+        _report_progress(
+            progress_callback,
+            f"Optimizing {len(conf_ids)} conformers",
+            1,
+            2,
+        )
+        with _suppress_cpp_stderr():
             best_conf_id, best_energy, all_converged = self._optimize_all_conformers(
                 mol, conf_ids
             )
+        _report_progress(progress_callback, "Conformer optimization complete", 2, 2)
 
         # Keep all conformers on the molecule (do NOT remove/re-add --
         # that invalidates C++ Conformer references in RDKit 2022.09).
@@ -147,8 +180,6 @@ class MMFFCalculator:
                 coverage * 100,
             )
 
-        breakdown = self.get_energy_breakdown(mol, conf_id=best_conf_id)
-
         return MMFFResult(
             molecule=mol,
             total_energy=best_energy,
@@ -158,7 +189,6 @@ class MMFFCalculator:
             num_heavy_atoms=n_heavy,
             energy_per_heavy_atom=best_energy / n_heavy,
             mmff_param_coverage=coverage,
-            energy_breakdown=breakdown,
         )
 
     def compute_single_point_energy(self, mol: Mol, conf_id: int = -1) -> float:
@@ -357,6 +387,7 @@ class MMFFCalculator:
         mol: Mol,
         n_seeds: int = 20,
         seed_offset: int = 2000,
+        progress_callback: Optional[ProgressCallback] = None,
     ) -> List[int]:
         """Add ``n_seeds`` random-coords ETKDG conformers, MMFF94-relaxed.
 
@@ -374,6 +405,9 @@ class MMFFCalculator:
         without re-using the same draw.
         """
         new_ids: List[int] = []
+        _report_progress(
+            progress_callback, f"Generating {n_seeds} diverse conformers", 0, 2
+        )
         try:
             with _suppress_cpp_stderr():
                 extra_ids = list(
@@ -392,6 +426,12 @@ class MMFFCalculator:
             logger.warning("Random-coords seed embedding failed: %s", exc)
             return []
 
+        _report_progress(
+            progress_callback,
+            f"Optimizing {len(extra_ids)} diverse conformers",
+            1,
+            2,
+        )
         for cid in extra_ids:
             energy, _ = self.optimize_conformer(mol, cid)
             if energy == float("inf"):
@@ -401,6 +441,7 @@ class MMFFCalculator:
                     pass
                 continue
             new_ids.append(cid)
+        _report_progress(progress_callback, "Diverse conformer seeding complete", 2, 2)
         return new_ids
 
     def seed_ring_pucker_conformers(
@@ -408,6 +449,7 @@ class MMFFCalculator:
         mol: Mol,
         ring_atom_indices: List[int],
         n_seeds: int = 24,
+        progress_callback: Optional[ProgressCallback] = None,
     ) -> List[int]:
         """Add ring-puckering-diverse conformer seeds for 4-7 membered rings.
 
@@ -421,7 +463,10 @@ class MMFFCalculator:
         if ring_size < 4 or ring_size > 7:
             return []
         return self.seed_random_coords_conformers(
-            mol, n_seeds=n_seeds, seed_offset=1000,
+            mol,
+            n_seeds=n_seeds,
+            seed_offset=1000,
+            progress_callback=progress_callback,
         )
 
     # ------------------------------------------------------------------
@@ -456,67 +501,35 @@ class MMFFCalculator:
         return covered / n_atoms if n_atoms > 0 else 0.0
 
     @staticmethod
-    def get_energy_breakdown(mol: Mol, conf_id: int = -1) -> Dict[str, float]:
-        """Return MMFF94 per-term energy decomposition.
+    def compute_vdw_energy(mol: Mol, conf_id: int = -1) -> float:
+        """Return the MMFF94 van der Waals energy at one geometry.
 
-        Builds one full force field for the total energy, then seven trimmed
-        force fields each with one term toggled off, and reports each term as
-        ``E_full - E_without_that_term``. Uses the per-term toggles exposed
-        on ``MMFFMolProperties`` (SetMMFF{Bond,Angle,StretchBend,Oop,Torsion,
-        VdW,Ele}Term) — the only way to isolate per-term contributions
-        through the Python API in this RDKit build.
+        Steric confinement only needs the vdW term. Building one force field
+        with every other contribution disabled avoids the former seven-term
+        decomposition and repeated force-field construction.
         """
-        return MMFFCalculator.decompose_energy(mol, conf_id=conf_id)
+        props = MMFFGetMoleculeProperties(mol)
+        if props is None:
+            return float("nan")
 
-    @staticmethod
-    def decompose_energy(mol: Mol, conf_id: int = -1) -> Dict[str, float]:
-        """MMFF94 per-term decomposition.
+        for setter in (
+            "SetMMFFBondTerm",
+            "SetMMFFAngleTerm",
+            "SetMMFFStretchBendTerm",
+            "SetMMFFOopTerm",
+            "SetMMFFTorsionTerm",
+            "SetMMFFEleTerm",
+        ):
+            if hasattr(props, setter):
+                getattr(props, setter)(False)
 
-        Returns a dict with keys ``total``, ``bond``, ``angle``,
-        ``stretch_bend``, ``oop``, ``torsion``, ``vdw``, ``electrostatic``.
-        Each component is the energy lost when its term is disabled —
-        i.e. its contribution to the total. The ``vdw`` term is the
-        physically meaningful "steric" component of MMFF94.
-        """
-        # Total energy
-        full_props = MMFFGetMoleculeProperties(mol)
-        if full_props is None:
-            return {"total": float("nan")}
-        full_ff = MMFFGetMoleculeForceField(mol, full_props, confId=conf_id)
-        if full_ff is None:
-            return {"total": float("nan")}
+        ff = MMFFGetMoleculeForceField(mol, props, confId=conf_id)
+        if ff is None:
+            return float("nan")
         try:
-            total = float(full_ff.CalcEnergy())
+            return float(ff.CalcEnergy())
         except Exception:
-            return {"total": float("nan")}
-
-        # Per-term contributions via toggle-off
-        term_setters = {
-            "bond":          "SetMMFFBondTerm",
-            "angle":         "SetMMFFAngleTerm",
-            "stretch_bend":  "SetMMFFStretchBendTerm",
-            "oop":           "SetMMFFOopTerm",
-            "torsion":       "SetMMFFTorsionTerm",
-            "vdw":           "SetMMFFVdWTerm",
-            "electrostatic": "SetMMFFEleTerm",
-        }
-        breakdown: Dict[str, float] = {"total": total}
-        for key, setter in term_setters.items():
-            props = MMFFGetMoleculeProperties(mol)
-            if props is None or not hasattr(props, setter):
-                breakdown[key] = float("nan")
-                continue
-            getattr(props, setter)(False)
-            ff = MMFFGetMoleculeForceField(mol, props, confId=conf_id)
-            if ff is None:
-                breakdown[key] = float("nan")
-                continue
-            try:
-                e_without = float(ff.CalcEnergy())
-                breakdown[key] = total - e_without
-            except Exception:
-                breakdown[key] = float("nan")
-        return breakdown
+            return float("nan")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -644,6 +657,7 @@ class MMFFCalculator:
         n_steps: int = 500,
         temperature: float = 300.0,
         perturb_fraction: float = 0.3,
+        progress_callback: Optional[ProgressCallback] = None,
     ) -> Tuple[int, float]:
         """Monte Carlo torsion search for global minimum conformer.
 
@@ -676,6 +690,7 @@ class MMFFCalculator:
         rng = _np.random.RandomState(self.random_seed)
         props = MMFFGetMoleculeProperties(mol)
         if props is None:
+            _report_progress(progress_callback, "Monte Carlo unavailable", 1, 1)
             return -1, float("inf")
 
         # Identify rotatable bonds (exclude bonds inside rings)
@@ -716,6 +731,9 @@ class MMFFCalculator:
                 if energy < best_energy:
                     best_energy = energy
                     best_conf_id = cid
+            _report_progress(
+                progress_callback, "No rotatable bonds; search complete", 1, 1
+            )
             return best_conf_id, best_energy
 
         # Find starting conformer (lowest energy among existing)
@@ -731,6 +749,7 @@ class MMFFCalculator:
                 start_conf_id = cid
 
         if start_conf_id < 0:
+            _report_progress(progress_callback, "Monte Carlo unavailable", 1, 1)
             return -1, float("inf")
 
         current_conf = mol.GetConformer(start_conf_id)
@@ -746,7 +765,12 @@ class MMFFCalculator:
         # every step.
         heavy_idxs, bonded_pairs = _collect_heavy_atoms(mol)
 
+        progress_interval = max(1, n_steps // 100)
         for step in range(n_steps):
+            if step % progress_interval == 0:
+                _report_progress(
+                    progress_callback, "Monte Carlo torsion search", step, n_steps
+                )
             new_conf = Chem.Conformer(current_conf)
             new_conf_id = mol.AddConformer(new_conf, assignId=True)
 
@@ -816,6 +840,9 @@ class MMFFCalculator:
             else:
                 mol.RemoveConformer(new_conf_id)
 
+        _report_progress(
+            progress_callback, "Monte Carlo torsion search", n_steps, n_steps
+        )
         return best_conf_id, best_energy
 
     # ------------------------------------------------------------------
@@ -829,6 +856,7 @@ class MMFFCalculator:
         temperatures: Tuple[float, ...] = (300.0, 500.0, 1000.0, 2000.0),
         swap_interval: int = 20,
         perturb_fraction: float = 0.3,
+        progress_callback: Optional[ProgressCallback] = None,
     ) -> Tuple[int, float]:
         """Replica-exchange MC for crossing energy barriers in bulky rings.
 
@@ -845,6 +873,9 @@ class MMFFCalculator:
         rng = _np.random.RandomState(self.random_seed)
         props = MMFFGetMoleculeProperties(mol)
         if props is None:
+            _report_progress(
+                progress_callback, "Parallel tempering unavailable", 1, 1
+            )
             return -1, float("inf")
 
         # Identify rotatable bonds (same logic as monte_carlo_search)
@@ -885,9 +916,15 @@ class MMFFCalculator:
                 start_conf_id = cid
 
         if start_conf_id < 0:
+            _report_progress(
+                progress_callback, "Parallel tempering unavailable", 1, 1
+            )
             return -1, float("inf")
 
         if not rotatable_bonds:
+            _report_progress(
+                progress_callback, "No rotatable bonds; search complete", 1, 1
+            )
             return start_conf_id, start_energy
 
         R = 0.001987
@@ -911,7 +948,15 @@ class MMFFCalculator:
         # pre-screen — see monte_carlo_search for the rationale.
         heavy_idxs, bonded_pairs = _collect_heavy_atoms(mol)
 
+        progress_interval = max(1, n_steps // 100)
         for step in range(n_steps):
+            if step % progress_interval == 0:
+                _report_progress(
+                    progress_callback,
+                    "Parallel-tempering torsion search",
+                    step,
+                    n_steps,
+                )
             # One MC move per replica at its own temperature
             for ridx, T in enumerate(temperatures):
                 rep = replicas[ridx]
@@ -1005,6 +1050,12 @@ class MMFFCalculator:
 
         # Re-attach the best snapshot as a fresh conformer with a valid ID
         best_conf_id = mol.AddConformer(best_conf_snapshot, assignId=True)
+        _report_progress(
+            progress_callback,
+            "Parallel-tempering torsion search",
+            n_steps,
+            n_steps,
+        )
         return best_conf_id, best_energy
 
     # ------------------------------------------------------------------
@@ -1104,25 +1155,25 @@ def _has_heavy_clash(
     if len(heavy_idxs) < 2:
         return False
 
-    coords = _np.array(
-        [list(conf.GetAtomPosition(i)) for i in heavy_idxs]
-    )
-    # Squared distances upper triangle
+    # ``GetPositions`` exposes one contiguous coordinate array.  Indexing it
+    # directly avoids allocating one Python list/NumPy array per atom on every
+    # MC/PT trial, which is a measurable fraction of the sampling runtime.
+    coords = _np.asarray(conf.GetPositions(), dtype=float)[heavy_idxs]
     diff = coords[:, None, :] - coords[None, :, :]
     d2 = (diff * diff).sum(axis=-1)
-    n = len(heavy_idxs)
-    thr2 = threshold * threshold
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            if d2[i, j] >= thr2:
-                continue
-            if bonded_pairs is not None:
-                pair = frozenset((heavy_idxs[i], heavy_idxs[j]))
-                if pair in bonded_pairs:
-                    continue
-            return True
-    return False
+    close = d2 < (threshold * threshold)
+    close = _np.triu(close, k=1)
+    if bonded_pairs is not None and close.any():
+        # Bonded heavy-atom pairs are excluded from the pre-screen.  Build the
+        # small mask once per trial; this preserves the previous exact logic
+        # while leaving the distance comparison in vectorized NumPy code.
+        bonded_mask = _np.zeros(close.shape, dtype=bool)
+        for i, atom_i in enumerate(heavy_idxs):
+            for j in range(i + 1, len(heavy_idxs)):
+                if frozenset((atom_i, heavy_idxs[j])) in bonded_pairs:
+                    bonded_mask[i, j] = True
+        close &= ~bonded_mask
+    return bool(close.any())
 
 
 def _collect_heavy_atoms(mol):

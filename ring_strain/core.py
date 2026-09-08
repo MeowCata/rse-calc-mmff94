@@ -10,7 +10,9 @@ a "Not Supported" message.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple  # noqa: F401
+from typing import Callable, Dict, List, Optional, Tuple  # noqa: F401
+import time
+import sys
 
 from rdkit import Chem
 from rdkit.Chem.rdchem import Mol
@@ -44,6 +46,129 @@ def _round_or_none(value: Optional[float], digits: int = 3) -> Optional[float]:
         return round(float(value), digits)
     except (TypeError, ValueError):
         return None
+
+
+def _format_duration(seconds: float) -> str:
+    """Format elapsed wall time compactly for progress and reports."""
+    seconds = max(0.0, float(seconds))
+    if seconds < 60.0:
+        return f"{seconds:.2f} s"
+    minutes, remainder = divmod(seconds, 60.0)
+    if minutes < 60.0:
+        return f"{int(minutes)} min {remainder:.1f} s"
+    hours, minutes = divmod(int(minutes), 60)
+    return f"{hours} h {minutes} min {remainder:.0f} s"
+
+
+@dataclass(frozen=True)
+class ProgressUpdate:
+    """One calculation-progress event emitted by :class:`StrainAnalyzer`."""
+
+    stage: str
+    task: str
+    progress: float
+    elapsed_seconds: float
+    smiles: str
+    current: Optional[int] = None
+    total: Optional[int] = None
+
+    @property
+    def percent(self) -> float:
+        """Return overall completion percentage for the analysis."""
+        return 100.0 * min(max(self.progress, 0.0), 1.0)
+
+
+class _ProgressTracker:
+    """Per-call progress state shared by nested stereoisomer analyses."""
+
+    def __init__(
+        self,
+        callback: Optional[Callable[[ProgressUpdate], None]],
+        smiles: str,
+        started_at: Optional[float] = None,
+        progress_start: float = 0.0,
+        progress_end: float = 1.0,
+        shared_progress: Optional[List[float]] = None,
+    ):
+        self.callback = callback
+        self.smiles = smiles
+        self.started_at = started_at if started_at is not None else time.perf_counter()
+        self.progress_start = progress_start
+        self.progress_end = progress_end
+        self._shared_progress = shared_progress or [progress_start]
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return time.perf_counter() - self.started_at
+
+    def emit(
+        self,
+        stage: str,
+        task: str,
+        progress: float,
+        current: Optional[int] = None,
+        total: Optional[int] = None,
+    ) -> None:
+        if self.callback is None:
+            return
+        local = min(max(progress, 0.0), 1.0)
+        overall = self.progress_start + local * (
+            self.progress_end - self.progress_start
+        )
+        overall = max(self._shared_progress[0], overall)
+        self._shared_progress[0] = overall
+        self._dispatch(ProgressUpdate(
+            stage=stage,
+            task=task,
+            progress=overall,
+            elapsed_seconds=self.elapsed_seconds,
+            smiles=self.smiles,
+            current=current,
+            total=total,
+        ))
+
+    def emit_current(self, stage: str, task: str) -> None:
+        """Emit a terminal status without falsely advancing progress."""
+        if self.callback is None:
+            return
+        self._dispatch(ProgressUpdate(
+            stage=stage,
+            task=task,
+            progress=self._shared_progress[0],
+            elapsed_seconds=self.elapsed_seconds,
+            smiles=self.smiles,
+        ))
+
+    def _dispatch(self, update: ProgressUpdate) -> None:
+        try:
+            self.callback(update)
+        except Exception as exc:
+            logger.warning("Progress callback failed: %s", exc)
+
+    def child(
+        self, progress_start: float, progress_end: float, smiles: str
+    ) -> "_ProgressTracker":
+        """Create a nested tracker mapped into part of this tracker's range."""
+        span = self.progress_end - self.progress_start
+        return _ProgressTracker(
+            callback=self.callback,
+            smiles=smiles,
+            started_at=self.started_at,
+            progress_start=self.progress_start + progress_start * span,
+            progress_end=self.progress_start + progress_end * span,
+            shared_progress=self._shared_progress,
+        )
+
+    def component_callback(
+        self, stage: str, progress_start: float, progress_end: float
+    ) -> Callable[[str, int, int], None]:
+        """Adapt low-level local counters into an overall status event."""
+        def callback(task: str, current: int, total: int) -> None:
+            fraction = current / total if total > 0 else 0.0
+            mapped = progress_start + fraction * (progress_end - progress_start)
+            self.emit(stage, task, mapped, current=current, total=total)
+
+        return callback
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +205,7 @@ class StrainReport:
     optimization_converged: bool
     conformers_sampled: int
     monte_carlo_used: bool
+    elapsed_time_seconds: float = 0.0
 
     # Comparison with known reference (if available)
     reference_match: Optional[Dict] = None
@@ -103,18 +229,6 @@ class StrainReport:
     pitzer_n_eclipsed: Optional[int] = None
     transannular_contacts: Optional[List[Dict]] = None
     steric_confinement_kcal_mol: Optional[float] = None
-
-    # ------------------------------------------------------------------
-    # MMFF94 per-term energy decomposition (cyclic - acyclic).
-    # vdW is the physically meaningful "true steric" strain; torsion is
-    # Pitzer-like; angle is Baeyer-like; bond is stretch. Diagnostic
-    # snapshots — not guaranteed to sum to total_strain_mmff_kcal_mol when
-    # Boltzmann averaging is in effect.
-    # ------------------------------------------------------------------
-    vdw_strain_kcal_mol: Optional[float] = None
-    torsion_strain_kcal_mol: Optional[float] = None
-    angle_strain_kcal_mol: Optional[float] = None
-    bond_strain_kcal_mol: Optional[float] = None
 
     # Stereochemistry: if the input SMILES had unassigned ring stereocenters
     # whose configuration affects strain (e.g. 1,3-di-tert-butyl-cyclohexane
@@ -166,6 +280,7 @@ class StrainReport:
             f"  Molecular weight:  {self.molecular_weight:.2f} g/mol",
             f"  Heavy atoms:       {self.num_heavy_atoms}",
             f"  Ring size:         {self.ring_size}-membered",
+            f"  Total elapsed time: {_format_duration(self.elapsed_time_seconds)}",
         ]
 
         if not self.is_supported:
@@ -209,7 +324,7 @@ class StrainReport:
                 )
             if self.pitzer_n_eclipsed is not None:
                 lines.append(
-                    f"  Pitzer (torsion) eclipsed: {self.pitzer_n_eclipsed}"
+                    f"  Pitzer eclipsed ring bonds: {self.pitzer_n_eclipsed}"
                 )
             if self.steric_confinement_kcal_mol is not None:
                 lines.append(
@@ -219,21 +334,6 @@ class StrainReport:
                 lines.append(
                     f"  Transannular contacts:  {len(self.transannular_contacts)}"
                 )
-
-        # MMFF94 per-term decomposition of cyclic - acyclic energies.
-        decomp_fields = (
-            ("vdw_strain_kcal_mol",     "vdW ΔE:    "),
-            ("torsion_strain_kcal_mol", "Torsion ΔE:     "),
-            ("angle_strain_kcal_mol",   "Angle ΔE:       "),
-            ("bond_strain_kcal_mol",    "Bond stretch ΔE:         "),
-        )
-        if any(getattr(self, f) is not None for f, _ in decomp_fields):
-            lines.append("")
-            lines.append("  --- MMFF94 Energy Decomposition (cyclic - acyclic) ---")
-            for field_name, label in decomp_fields:
-                val = getattr(self, field_name)
-                if val is not None:
-                    lines.append(f"  {label} {val:+.2f} kcal/mol")
 
         if (self.strain_range_kcal_mol is not None
                 or self.stereoisomer_cyclic_gap_kcal_mol is not None
@@ -318,6 +418,8 @@ class StrainAnalyzer:
         Use Monte Carlo torsion search for substituted cycloalkanes.
     mc_steps : int
         Number of Monte Carlo steps (default 500).
+    progress_callback : callable, optional
+        Receives :class:`ProgressUpdate` events while an analysis runs.
     """
 
     def __init__(
@@ -329,7 +431,9 @@ class StrainAnalyzer:
         mc_steps: int = 500,
         use_parallel_tempering: bool = True,
         use_boltzmann: bool = True,
+        progress_callback: Optional[Callable[[ProgressUpdate], None]] = None,
     ):
+        self.progress_callback = progress_callback
         self.mmff_calc = MMFFCalculator(
             n_conformers=n_conformers,
             random_seed=random_seed,
@@ -347,7 +451,33 @@ class StrainAnalyzer:
     # Main API
     # ------------------------------------------------------------------
 
-    def analyze(self, smiles: str) -> StrainReport:
+    def analyze(
+        self,
+        smiles: str,
+        *,
+        progress_callback: Optional[Callable[[ProgressUpdate], None]] = None,
+    ) -> StrainReport:
+        """Analyze one SMILES and report progress plus total wall time."""
+        callback = (
+            progress_callback
+            if progress_callback is not None
+            else self.progress_callback
+        )
+        progress = _ProgressTracker(callback, smiles)
+        progress.emit("start", "Starting analysis", 0.0)
+        try:
+            report = self._analyze(smiles, progress)
+        except Exception:
+            progress.emit_current("error", "Analysis failed")
+            raise
+
+        report.elapsed_time_seconds = round(progress.elapsed_seconds, 3)
+        progress.emit("complete", "Analysis complete", 1.0)
+        return report
+
+    def _analyze(
+        self, smiles: str, progress: _ProgressTracker
+    ) -> StrainReport:
         """Analyze ring strain for a monocyclic saturated carbocycle.
 
         Pipeline:
@@ -382,15 +512,18 @@ class StrainAnalyzer:
         # the strain range. We only branch when there are >= 2 unassigned
         # ring centers AND we haven't already been called for an isomer
         # (`_enumerated_from_smiles` is the sentinel).
-        stereo_range = self._maybe_enumerate_stereo(smiles, mol)
+        progress.emit("stereo", "Checking stereochemistry", 0.05)
+        stereo_range = self._maybe_enumerate_stereo(smiles, mol, progress)
         if stereo_range is not None:
             return stereo_range
 
         # --- Step 2: Ring validation ---
+        progress.emit("validation", "Validating ring system", 0.08)
         ring_analyzer = RingAnalyzer(mol)
         is_valid, message, ring_info = ring_analyzer.validate()
 
         if not is_valid:
+            progress.emit("validation", "Preparing unsupported-input report", 0.95)
             return self._not_supported_report(smiles, mol, message)
 
         assert ring_info is not None
@@ -401,7 +534,13 @@ class StrainAnalyzer:
         # --- Step 3: Generate optimized cyclic conformers ---
         monte_carlo_used = False
         try:
-            cyclic_result = self.mmff_calc.embed_and_optimize(Chem.Mol(mol))
+            progress.emit("conformers", "Generating and optimizing cyclic conformers", 0.10)
+            cyclic_result = self.mmff_calc.embed_and_optimize(
+                Chem.Mol(mol),
+                progress_callback=progress.component_callback(
+                    "conformers", 0.10, 0.28
+                ),
+            )
             cyclic_mol = cyclic_result.molecule
             best_conf_id = cyclic_result.best_conf_id
 
@@ -415,6 +554,9 @@ class StrainAnalyzer:
                     self.mmff_calc.seed_ring_pucker_conformers(
                         cyclic_mol,
                         ring_info.atom_indices,
+                        progress_callback=progress.component_callback(
+                            "conformers", 0.28, 0.35
+                        ),
                     )
                 except Exception as exc:
                     logger.warning(
@@ -429,6 +571,7 @@ class StrainAnalyzer:
             # substituted one of the same heavy-atom count.
             if is_substituted and self.use_monte_carlo:
                 try:
+                    progress.emit("sampling", "Searching cyclic torsions", 0.35)
                     # Cap bulk at 15 for sampling depth — see mmff.py for
                     # the rationale (diminishing returns + PT replicas
                     # already cover long-range vdW couplings).
@@ -445,10 +588,17 @@ class StrainAnalyzer:
                             cyclic_mol,
                             n_steps=pt_steps,
                             temperatures=pt_temps,
+                            progress_callback=progress.component_callback(
+                                "sampling", 0.35, 0.52
+                            ),
                         )
                     else:
                         mc_best_id, _ = self.mmff_calc.monte_carlo_search(
-                            cyclic_mol, n_steps=mc_steps_eff,
+                            cyclic_mol,
+                            n_steps=mc_steps_eff,
+                            progress_callback=progress.component_callback(
+                                "sampling", 0.35, 0.52
+                            ),
                         )
                     if mc_best_id >= 0:
                         best_conf_id = mc_best_id
@@ -463,6 +613,7 @@ class StrainAnalyzer:
             boltzmann_energy = None
             if self.use_boltzmann and is_substituted:
                 try:
+                    progress.emit("sampling", "Clustering cyclic conformers", 0.55)
                     kept = self.mmff_calc.cluster_conformers(
                         cyclic_mol,
                         rmsd_threshold=0.5,
@@ -503,13 +654,18 @@ class StrainAnalyzer:
             if best_conf_id >= 0 and cyclic_mol.GetNumConformers() > 1:
                 best_conf = Chem.Conformer(cyclic_mol.GetConformer(best_conf_id))
                 cyclic_mol.RemoveAllConformers()
-                cyclic_mol.AddConformer(best_conf, assignId=True)
+                best_conf_id = cyclic_mol.AddConformer(best_conf, assignId=True)
 
+            progress.emit("reference", "Computing ring-opening reference", 0.60)
             raw_strain, components = self.homo_analyzer.compute_strain(
                 mol, ring_info, cyclic_mol=cyclic_mol,
                 cyclic_energy_override=boltzmann_energy,
                 use_boltzmann=self.use_boltzmann,
+                progress_callback=progress.component_callback(
+                    "reference", 0.60, 0.82
+                ),
             )
+            progress.emit("diagnostics", "Computing geometry diagnostics", 0.82)
 
             # --- Geometry analysis (Baeyer/Pitzer/transannular) ---
             geo_breakdown = None
@@ -525,24 +681,26 @@ class StrainAnalyzer:
                     baeyer_rms = geo_breakdown["angle_strain"]["rms_deviation"]
                     pitzer_ne = geo_breakdown["torsional_strain"]["n_eclipsed"]
                     transann = geo_breakdown["transannular_contacts"]
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Geometry analysis failed for %s: %s", smiles, exc)
 
-            steric_conf = components.get("steric_confinement_kcal_mol", 0.0)
-            if steric_conf != steric_conf:  # NaN guard
-                steric_conf = 0.0
+            steric_conf = components.get("steric_confinement_kcal_mol")
+            if steric_conf is not None and steric_conf != steric_conf:  # NaN guard
+                steric_conf = None
         except Exception as exc:
             raise RuntimeError(
                 f"MMFF94 computation failed for {smiles!r}: {exc}"
             ) from exc
 
         # --- Step 4: Calibrate ---
+        progress.emit("calibration", "Calibrating strain", 0.90)
         calibrated = self.calibrator.calibrate(raw_strain, ring_info.size)
         stereo_baseline = self._stereo_minimum_baseline(
             mol,
             ring_info,
             current_cyclic_energy=components.get("cyclic_energy"),
             current_calibrated=calibrated,
+            progress=progress,
         )
         if stereo_baseline is not None:
             calibrated = stereo_baseline
@@ -555,6 +713,7 @@ class StrainAnalyzer:
         category = self.scorer.categorize(score)
 
         # --- Step 6: Reference comparison ---
+        progress.emit("report", "Preparing report", 0.98)
         ref_match = self._find_reference_match(mol, calibrated)
 
         # --- Diagnostics ---
@@ -595,11 +754,7 @@ class StrainAnalyzer:
             baeyer_strain_rms_deg=round(baeyer_rms, 2) if baeyer_rms is not None else None,
             pitzer_n_eclipsed=pitzer_ne,
             transannular_contacts=transann,
-            steric_confinement_kcal_mol=round(steric_conf, 3) if steric_conf else None,
-            vdw_strain_kcal_mol=_round_or_none(components.get("vdw_strain")),
-            torsion_strain_kcal_mol=_round_or_none(components.get("torsion_strain")),
-            angle_strain_kcal_mol=_round_or_none(components.get("angle_strain")),
-            bond_strain_kcal_mol=_round_or_none(components.get("bond_strain")),
+            steric_confinement_kcal_mol=_round_or_none(steric_conf),
             cyclic_energy_kcal_mol=_round_or_none(components.get("cyclic_energy")),
         )
 
@@ -612,7 +767,7 @@ class StrainAnalyzer:
         results = []
         for i, smi in enumerate(smiles_list):
             if show_progress:
-                print(f"[{i+1}/{len(smiles_list)}] {smi}")
+                print(f"[{i+1}/{len(smiles_list)}] {smi}", file=sys.stderr)
             try:
                 report = self.analyze(smi)
             except Exception as exc:
@@ -686,7 +841,7 @@ class StrainAnalyzer:
     # ------------------------------------------------------------------
 
     def _maybe_enumerate_stereo(
-        self, smiles: str, mol: Mol
+        self, smiles: str, mol: Mol, progress: _ProgressTracker
     ) -> Optional[StrainReport]:
         """If the input has unassigned ring stereo, enumerate diastereomers.
 
@@ -694,7 +849,7 @@ class StrainAnalyzer:
         trans configuration changes strain by ~10 kcal/mol — but a SMILES
         without ``@`` markers is genuinely ambiguous between them. We detect
         this case, enumerate via ``EnumerateStereoisomers`` (with
-        ``onlyUnassigned=True``), call ``analyze`` recursively on each
+        ``onlyUnassigned=True``), analyze each within the root progress scope,
         canonical isomer SMILES, and return a single report carrying the
         (min, max) calibrated-strain range along with the lowest-strain
         isomer's full diagnostics.
@@ -741,13 +896,25 @@ class StrainAnalyzer:
             return None
 
         # Analyze each canonical isomer; the enumerated mols have all stereo
-        # assigned, so the recursive analyze() call's stereo check returns
+        # assigned, so the recursive _analyze() call's stereo check returns
         # None and falls through to normal analysis — no infinite loop.
         per_isomer: List[StrainReport] = []
-        for iso in isomers:
+        n_isomers = len(isomers)
+        for index, iso in enumerate(isomers, start=1):
             iso_smiles = Chem.MolToSmiles(iso, canonical=True, isomericSmiles=True)
+            start = 0.08 + 0.84 * (index - 1) / n_isomers
+            end = 0.08 + 0.84 * index / n_isomers
+            progress.emit(
+                "stereo",
+                f"Analyzing stereoisomer {index}/{n_isomers}",
+                start,
+                current=index,
+                total=n_isomers,
+            )
             try:
-                rep = self.analyze(iso_smiles)
+                rep = self._analyze(
+                    iso_smiles, progress.child(start, end, iso_smiles)
+                )
             except Exception as exc:
                 logger.warning(
                     "Stereoisomer %s analysis failed: %s", iso_smiles, exc,
@@ -801,6 +968,7 @@ class StrainAnalyzer:
             f"diastereomers; reporting the lowest-strain isomer with "
             f"(min, max) range across all."
         ]
+        progress.emit("stereo", "Aggregating stereoisomer results", 0.96)
         return primary
 
     def _stereo_minimum_baseline(
@@ -809,6 +977,7 @@ class StrainAnalyzer:
         ring_info: RingInfo,
         current_cyclic_energy: Optional[float],
         current_calibrated: float,
+        progress: _ProgressTracker,
     ) -> Optional[float]:
         """Zero low-strain stereochemical baselines for substituted rings.
 
@@ -863,15 +1032,27 @@ class StrainAnalyzer:
             mol, canonical=True, isomericSmiles=True,
         )
         energies = {current_smiles: float(current_cyclic_energy)}
-        for iso in isomers:
+        n_isomers = len(isomers)
+        for index, iso in enumerate(isomers, start=1):
             iso_smiles = Chem.MolToSmiles(
                 iso, canonical=True, isomericSmiles=True,
             )
             if iso_smiles in energies:
                 continue
+            start = 0.90 + 0.07 * (index - 1) / n_isomers
+            end = 0.90 + 0.07 * index / n_isomers
+            progress.emit(
+                "stereo-baseline",
+                f"Checking stereochemical baseline {index}/{n_isomers}",
+                start,
+                current=index,
+                total=n_isomers,
+            )
             try:
                 energies[iso_smiles] = self._compute_cyclic_energy_only(
-                    Chem.Mol(iso), ring_info,
+                    Chem.Mol(iso),
+                    ring_info,
+                    progress.child(start, end, iso_smiles),
                 )
             except Exception as exc:
                 logger.debug(
@@ -891,9 +1072,15 @@ class StrainAnalyzer:
         self,
         mol: Mol,
         ring_info: RingInfo,
+        progress: _ProgressTracker,
     ) -> float:
         """Compute the cyclic-side energy with the production sampling path."""
-        cyclic_result = self.mmff_calc.embed_and_optimize(Chem.Mol(mol))
+        cyclic_result = self.mmff_calc.embed_and_optimize(
+            Chem.Mol(mol),
+            progress_callback=progress.component_callback(
+                "stereo-baseline", 0.0, 0.30
+            ),
+        )
         cyclic_mol = cyclic_result.molecule
         best_conf_id = cyclic_result.best_conf_id
 
@@ -902,6 +1089,9 @@ class StrainAnalyzer:
                 self.mmff_calc.seed_ring_pucker_conformers(
                     cyclic_mol,
                     ring_info.atom_indices,
+                    progress_callback=progress.component_callback(
+                        "stereo-baseline", 0.30, 0.40
+                    ),
                 )
             except Exception as exc:
                 logger.debug("Ring puckering probe failed: %s", exc)
@@ -917,10 +1107,17 @@ class StrainAnalyzer:
                         cyclic_mol,
                         n_steps=pt_steps,
                         temperatures=pt_temps,
+                        progress_callback=progress.component_callback(
+                            "stereo-baseline", 0.40, 0.80
+                        ),
                     )
                 else:
                     mc_best_id, _ = self.mmff_calc.monte_carlo_search(
-                        cyclic_mol, n_steps=mc_steps_eff,
+                        cyclic_mol,
+                        n_steps=mc_steps_eff,
+                        progress_callback=progress.component_callback(
+                            "stereo-baseline", 0.40, 0.80
+                        ),
                     )
                 if mc_best_id >= 0:
                     best_conf_id = mc_best_id
@@ -929,6 +1126,9 @@ class StrainAnalyzer:
 
         if self.use_boltzmann and mol.GetNumHeavyAtoms() > ring_info.size:
             try:
+                progress.emit(
+                    "stereo-baseline", "Clustering baseline conformers", 0.82
+                )
                 kept = self.mmff_calc.cluster_conformers(
                     cyclic_mol,
                     rmsd_threshold=0.5,
@@ -942,15 +1142,21 @@ class StrainAnalyzer:
                     cyclic_mol.RemoveAllConformers()
                     for c in keep_confs:
                         cyclic_mol.AddConformer(c, assignId=True)
-                    return self.mmff_calc.compute_boltzmann_energy(
+                    energy = self.mmff_calc.compute_boltzmann_energy(
                         cyclic_mol, temperature=298.15,
                     )
+                    progress.emit(
+                        "stereo-baseline", "Baseline conformer averaging complete", 1.0
+                    )
+                    return energy
             except Exception as exc:
                 logger.debug("Stereo baseline Boltzmann probe failed: %s", exc)
 
-        return self.mmff_calc.compute_single_point_energy(
+        energy = self.mmff_calc.compute_single_point_energy(
             cyclic_mol, conf_id=best_conf_id,
         )
+        progress.emit("stereo-baseline", "Baseline energy complete", 1.0)
+        return energy
 
     def _not_supported_report(
         self, smiles: str, mol: Mol, message: str

@@ -199,3 +199,60 @@
   Angle (Baeyer):        -0.13 kcal/mol
   Bond stretch:          -0.16 kcal/mol
 ============================================================
+
+
+
+:\Users\admin\Desktop\ring-strain-calc-mmff94-main>python -m cli.main "C1CCC(CC)C(CC(C))C1"
+[ 100.0%] Analysis complete | elapsed 1144.9 s
+============================================================
+  Ring Strain Analysis: C1CCC(CC)C(CC(C))C1
+============================================================
+  Formula:           C11H22
+  Molecular weight:  154.30 g/mol
+  Heavy atoms:       11
+  Ring size:         6-membered
+  Total elapsed time: 19 min 4.9 s
+  Ring type:          monocyclic saturated carbocycle (substituted)
+  Monte Carlo search: yes
+
+  Raw MMFF94 strain:       +13.87 kcal/mol
+  Calibrated strain:       +4.71 kcal/mol
+  Strain per heavy atom:   +0.428 kcal/mol
+  Uncertainty:             +/- 2.5 kcal/mol
+
+  Strain score(higher is more stable):      55.5 / 100  (moderate strain)
+
+  WARNING: Stereochemistry unspecified — analyzed 4 diastereomers; reporting the lowest-strain isomer with (min, max) range across all.
+
+  --- Geometry Decomposition ---
+  Baeyer (angle) RMS:     2.0 deg
+  Pitzer eclipsed ring bonds: 0
+  Steric confinement:     +4.15 kcal/mol
+
+------------------------------------------------------------
+  STEREOISOMER ANALYSIS (cis/trans)
+------------------------------------------------------------
+  Diastereomers analyzed:   4
+  Cyclic-energy gap:        +0.49 kcal/mol  (MMFF94 native — calibration-free)
+  Calibrated strain range:  +4.71 .. +4.86 kcal/mol  (spread +0.14)
+
+  Per-isomer breakdown (lowest-strain marked *):
+  * CCC[C@@H]1CCCC[C@H]1CC            cal= +4.71  raw=+13.87  E_cyclic=  +8.74
+    CCC[C@H]1CCCC[C@@H]1CC            cal= +4.72  raw=+13.89  E_cyclic=  +8.76
+    CCC[C@@H]1CCCC[C@@H]1CC           cal= +4.84  raw=+14.30  E_cyclic=  +9.18
+    CCC[C@H]1CCCC[C@H]1CC             cal= +4.86  raw=+14.37  E_cyclic=  +9.24
+
+  Note: cyclic-energy gap directly reflects MMFF94's stereo
+  discrimination; calibrated range may compress small gaps
+  due to per-size calibration slope < 1
+
+
+============================================================                                      Ring Strain Analysis: CC1(C)CCCC1             ============================================================                                      Formula:           C7H14                        Molecular weight:  98.19 g/mol                  Heavy atoms:       7                            Ring size:         5-membered                   Total elapsed time: 1 min 55.0 s                Ring type:          monocyclic saturated carbocycle (substituted)                               Monte Carlo search: yes                                                                         Raw MMFF94 strain:       +15.46 kcal/mol        Calibrated strain:       +7.20 kcal/mol         Strain per heavy atom:   +1.028 kcal/mol        Uncertainty:             +/- 2.5 kcal/mol                                                       Strain score(higher is more stable):      40.7 / 100  (moderate strain)                                                                         Reference match: 1,1-dimethylcyclopentane         Computed:  7.20 kcal/mol                        Reference: 7.5 kcal/mol                                                                       --- Geometry Decomposition ---                  Baeyer (angle) RMS:     5.0 deg                 Pitzer eclipsed ring bonds: 1                   Steric confinement:     +0.34 kcal/mol        ============================================================
+
+
+
+=============                                      Ring Strain Analysis: CC1CCCC1                ============================================================                                      Formula:           C6H12                        Molecular weight:  84.16 g/mol                  Heavy atoms:       6                            Ring size:         5-membered                   Total elapsed time: 1 min 6.1 s                 Ring type:          monocyclic saturated carbocycle (substituted)                               Monte Carlo search: yes                                                                         Raw MMFF94 strain:       +10.76 kcal/mol        Calibrated strain:       +6.88 kcal/mol         Strain per heavy atom:   +1.147 kcal/mol        Uncertainty:             +/- 2.5 kcal/mol                                                       Strain score(higher is more stable):      42.3 / 100  (moderate strain)                                                                         Reference match: methylcyclopentane               Computed:  6.88 kcal/mol                        Reference: 6.4 kcal/mol                                                                       --- Geometry Decomposition ---                  Baeyer (angle) RMS:     5.2 deg                 Pitzer eclipsed ring bonds: 1                   Steric confinement:     -0.79 kcal/mol        ============================================================
+
+
+
+=============                                      Ring Strain Analysis: CCC1(C)CCCC1            ============================================================                                      Formula:           C8H16                        Molecular weight:  112.22 g/mol                 Heavy atoms:       8                            Ring size:         5-membered                   Total elapsed time: 2 min 53.0 s                Ring type:          monocyclic saturated carbocycle (substituted)                               Monte Carlo search: yes                                                                         Raw MMFF94 strain:       +15.56 kcal/mol        Calibrated strain:       +7.20 kcal/mol         Strain per heavy atom:   +0.900 kcal/mol        Uncertainty:             +/- 2.5 kcal/mol                                                       Strain score(higher is more stable):      40.6 / 100  (moderate strain)                                                                         --- Geometry Decomposition ---                  Baeyer (angle) RMS:     5.0 deg                 Pitzer eclipsed ring bonds: 1                   Steric confinement:     +0.86 kcal/mol        ==========================================================

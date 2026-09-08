@@ -17,7 +17,7 @@ from rdkit import Chem
 from rdkit.Chem import rdchem
 from rdkit.Chem.rdchem import Mol, RWMol
 
-from .mmff import MMFFCalculator, MMFFResult
+from .mmff import MMFFCalculator, ProgressCallback
 from .ring_analysis import RingInfo, _get_ring_bonds
 
 import logging
@@ -27,6 +27,49 @@ logger = logging.getLogger(__name__)
 # Module-level caches for immutable MMFF94 constants
 _ETHANE_ENERGY: Optional[float] = None
 _CYCLOALKANE_STRAIN_CACHE: Dict[int, float] = {}
+
+
+def _subtask_progress(
+    callback: Optional[ProgressCallback],
+    index: int,
+    total: int,
+    label: str,
+) -> Optional[ProgressCallback]:
+    """Map a collaborator's local counter into one item of a larger loop."""
+    if callback is None:
+        return None
+
+    units_per_item = 100
+
+    def report(task: str, current: int, task_total: int) -> None:
+        fraction = current / task_total if task_total > 0 else 0.0
+        overall_current = (index - 1) * units_per_item + round(
+            fraction * units_per_item
+        )
+        callback(
+            f"{label} {index}/{total}: {task}",
+            overall_current,
+            total * units_per_item,
+        )
+
+    return report
+
+
+def _range_progress(
+    callback: Optional[ProgressCallback],
+    start: float,
+    end: float,
+) -> Optional[ProgressCallback]:
+    """Map a collaborator's counter into a fractional range of one task."""
+    if callback is None:
+        return None
+
+    def report(task: str, current: int, total: int) -> None:
+        fraction = current / total if total > 0 else 0.0
+        mapped = start + min(max(fraction, 0.0), 1.0) * (end - start)
+        callback(task, round(mapped * 1000), 1000)
+
+    return report
 
 
 @dataclass
@@ -64,6 +107,7 @@ class HomodesmoticAnalyzer:
         cyclic_energy_override: Optional[float] = None,
         acyclic_energy_override: Optional[float] = None,
         use_boltzmann: bool = True,
+        progress_callback: Optional[ProgressCallback] = None,
     ) -> Tuple[float, Dict[str, float]]:
         """Compute raw MMFF94 ring strain energy.
 
@@ -81,6 +125,7 @@ class HomodesmoticAnalyzer:
             use_boltzmann: When True (default) and the molecule is substituted,
                 the acyclic reference also gets Boltzmann thermal averaging,
                 matching the cyclic side treatment.
+            progress_callback: Optional local-task progress callback.
 
         Returns:
             (strain_kcal_mol, energy_components)
@@ -91,12 +136,16 @@ class HomodesmoticAnalyzer:
         elif cyclic_mol is not None:
             cyclic_energy = self.mmff.compute_single_point_energy(cyclic_mol)
         else:
-            cyclic_result = self.mmff.embed_and_optimize(Chem.Mol(mol))
+            cyclic_result = self.mmff.embed_and_optimize(
+                Chem.Mol(mol), progress_callback=progress_callback
+            )
             cyclic_energy = cyclic_result.total_energy
 
         # For unsubstituted cycloalkanes: strict bond-balanced method
         if _is_unsubstituted_cycloalkane(mol, ring_info):
-            strain = self.compute_cycloalkane_strain(ring_info.size)
+            strain = self.compute_cycloalkane_strain(
+                ring_info.size, progress_callback=progress_callback
+            )
             if strain is not None:
                 components = {
                     "cyclic_energy": cyclic_energy,
@@ -117,7 +166,10 @@ class HomodesmoticAnalyzer:
         else:
             acyclic_mol_for_decomp, acyclic_energy = (
                 self._compute_acyclic_energy_with_mol(
-                    mol, ring_info, use_boltzmann=use_boltzmann,
+                    mol,
+                    ring_info,
+                    use_boltzmann=use_boltzmann,
+                    progress_callback=progress_callback,
                 )
             )
             method = (
@@ -133,38 +185,20 @@ class HomodesmoticAnalyzer:
 
         raw_strain = cyclic_energy - acyclic_energy
 
-        # MMFF94 per-term decomposition of the cyclic vs acyclic geometries.
-        # The vdW component is the physically meaningful "steric strain" — the
-        # extra non-bonded repulsion the substituents experience in the ring
-        # vs the open chain. Torsion captures Pitzer-like eclipsing; angle
-        # captures Baeyer-like bond-angle deformation; bond captures stretch.
-        # Decomposition uses single representative geometries (the conformer
-        # currently on each mol), so the terms are diagnostic snapshots —
-        # they will not sum exactly to raw_strain when Boltzmann averaging
-        # is in effect on either side.
+        # Steric confinement is the cyclic-minus-acyclic MMFF94 vdW term at
+        # representative geometries. It remains a diagnostic snapshot and
+        # need not track the Boltzmann-averaged total strain exactly.
         if cyclic_mol is not None and acyclic_mol_for_decomp is not None:
             try:
-                cyc_dec = self.mmff.decompose_energy(cyclic_mol)
-                acyc_dec = self.mmff.decompose_energy(acyclic_mol_for_decomp)
-                for term, key in (
-                    ("vdw", "vdw_strain"),
-                    ("torsion", "torsion_strain"),
-                    ("angle", "angle_strain"),
-                    ("bond", "bond_strain"),
-                ):
-                    c_val = cyc_dec.get(term, float("nan"))
-                    a_val = acyc_dec.get(term, float("nan"))
-                    if c_val == c_val and a_val == a_val:  # NaN guards
-                        components[key] = c_val - a_val
+                cyclic_vdw = self.mmff.compute_vdw_energy(cyclic_mol)
+                acyclic_vdw = self.mmff.compute_vdw_energy(acyclic_mol_for_decomp)
+                if cyclic_vdw == cyclic_vdw and acyclic_vdw == acyclic_vdw:
+                    components["steric_confinement_kcal_mol"] = (
+                        cyclic_vdw - acyclic_vdw
+                    )
             except Exception as exc:
-                logger.warning("Per-term decomposition failed: %s", exc)
+                logger.warning("Steric-confinement calculation failed: %s", exc)
 
-        # Backwards-compatible alias: steric_confinement_kcal_mol now means
-        # vdw_strain specifically (the breaking-change scope agreed in the
-        # plan). Falls back to zero if decomposition unavailable.
-        components["steric_confinement_kcal_mol"] = components.get(
-            "vdw_strain", 0.0
-        )
         return raw_strain, components
 
     def _compute_acyclic_energy_with_mol(
@@ -172,6 +206,7 @@ class HomodesmoticAnalyzer:
         mol: Mol,
         ring_info: RingInfo,
         use_boltzmann: bool = True,
+        progress_callback: Optional[ProgressCallback] = None,
     ) -> Tuple[Mol, float]:
         """Compute the acyclic reference energy, with optional Boltzmann averaging.
 
@@ -189,9 +224,23 @@ class HomodesmoticAnalyzer:
         best_mol = None
         best_energy = float("inf")
 
-        for acyclic_raw, _broken_bond in candidates:
+        n_candidates = len(candidates)
+        for candidate_index, (acyclic_raw, _broken_bond) in enumerate(
+            candidates, start=1
+        ):
+            candidate_progress = _subtask_progress(
+                progress_callback,
+                candidate_index,
+                n_candidates,
+                "Acyclic reference",
+            )
             try:
-                acyclic_result = self.mmff.embed_and_optimize(acyclic_raw)
+                acyclic_result = self.mmff.embed_and_optimize(
+                    acyclic_raw,
+                    progress_callback=_range_progress(
+                        candidate_progress, 0.00, 0.20
+                    ),
+                )
                 acyclic_with_H = acyclic_result.molecule
                 acyclic_energy = acyclic_result.total_energy
 
@@ -209,6 +258,9 @@ class HomodesmoticAnalyzer:
                             acyclic_with_H,
                             n_seeds=min(20, 10 + bulk),
                             seed_offset=3000,
+                            progress_callback=_range_progress(
+                                candidate_progress, 0.20, 0.28
+                            ),
                         )
                     except Exception as exc:
                         logger.warning(
@@ -227,12 +279,19 @@ class HomodesmoticAnalyzer:
                         acyclic_with_H,
                         n_steps=pt_steps_eff,
                         temperatures=pt_temps_eff,
+                        progress_callback=_range_progress(
+                            candidate_progress, 0.28, 0.70
+                        ),
                     )
                     if pt_id >= 0 and pt_energy < mc_energy:
                         mc_energy = pt_energy
                     else:
                         mc_id, mc_e = self.mmff.monte_carlo_search(
-                            acyclic_with_H, n_steps=mc_steps_eff,
+                            acyclic_with_H,
+                            n_steps=mc_steps_eff,
+                            progress_callback=_range_progress(
+                                candidate_progress, 0.70, 0.85
+                            ),
                         )
                         if mc_id >= 0 and mc_e < mc_energy:
                             mc_energy = mc_e
@@ -242,6 +301,8 @@ class HomodesmoticAnalyzer:
 
                 if use_boltzmann:
                     try:
+                        if candidate_progress is not None:
+                            candidate_progress("Clustering conformers", 85, 100)
                         kept = self.mmff.cluster_conformers(
                             acyclic_with_H,
                             rmsd_threshold=0.5,
@@ -255,6 +316,8 @@ class HomodesmoticAnalyzer:
                             acyclic_with_H.RemoveAllConformers()
                             for c in keep_confs:
                                 acyclic_with_H.AddConformer(c, assignId=True)
+                        if candidate_progress is not None:
+                            candidate_progress("Averaging conformer energies", 95, 100)
                         boltz_e = self.mmff.compute_boltzmann_energy(
                             acyclic_with_H, temperature=298.15,
                         )
@@ -273,7 +336,9 @@ class HomodesmoticAnalyzer:
                     "Acyclic reference for bond %s failed: %s",
                     _broken_bond, exc,
                 )
-                continue
+            finally:
+                if candidate_progress is not None:
+                    candidate_progress("Complete", 1, 1)
 
         if best_mol is None:
             raise RuntimeError(
@@ -431,7 +496,11 @@ class HomodesmoticAnalyzer:
             ),
         )
 
-    def compute_cycloalkane_strain(self, ring_size: int) -> Optional[float]:
+    def compute_cycloalkane_strain(
+        self,
+        ring_size: int,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> Optional[float]:
         """Compute raw homodesmotic strain for an unsubstituted cycloalkane.
 
         Uses the strict bond-balanced reaction scheme.
@@ -440,6 +509,8 @@ class HomodesmoticAnalyzer:
         global _ETHANE_ENERGY, _CYCLOALKANE_STRAIN_CACHE
 
         if ring_size in _CYCLOALKANE_STRAIN_CACHE:
+            if progress_callback is not None:
+                progress_callback("Using cached cycloalkane reference", 1, 1)
             return _CYCLOALKANE_STRAIN_CACHE[ring_size]
 
         reaction = self.build_cycloalkane_homodesmotic_reaction(ring_size)
@@ -448,16 +519,33 @@ class HomodesmoticAnalyzer:
 
         try:
             cyclic_mol = Chem.MolFromSmiles(reaction.cyclic_reactant_smiles)
-            cyclic_result = self.mmff.embed_and_optimize(cyclic_mol)
+            cyclic_result = self.mmff.embed_and_optimize(
+                cyclic_mol,
+                progress_callback=_subtask_progress(
+                    progress_callback, 1, 3, "Cycloalkane reaction"
+                ),
+            )
             cyclic_energy = cyclic_result.total_energy
 
             if _ETHANE_ENERGY is None:
                 ethane_mol = Chem.MolFromSmiles("CC")
-                ethane_result = self.mmff.embed_and_optimize(ethane_mol)
+                ethane_result = self.mmff.embed_and_optimize(
+                    ethane_mol,
+                    progress_callback=_subtask_progress(
+                        progress_callback, 2, 3, "Cycloalkane reaction"
+                    ),
+                )
                 _ETHANE_ENERGY = ethane_result.total_energy
+            elif progress_callback is not None:
+                progress_callback("Cycloalkane reaction 2/3: cached ethane", 2, 3)
 
             linear_mol = Chem.MolFromSmiles(reaction.acyclic_product_smiles)
-            linear_result = self.mmff.embed_and_optimize(linear_mol)
+            linear_result = self.mmff.embed_and_optimize(
+                linear_mol,
+                progress_callback=_subtask_progress(
+                    progress_callback, 3, 3, "Cycloalkane reaction"
+                ),
+            )
             linear_energy = linear_result.total_energy
 
             strain = cyclic_energy + _ETHANE_ENERGY - linear_energy

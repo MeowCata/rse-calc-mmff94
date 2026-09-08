@@ -43,7 +43,7 @@ python -m cli.main --benchmark
 python scripts/derive_calibration.py
 ```
 
-CLI knobs that materially change results: `--n-conformers` (default 200), `--mc-steps` (default 500), `--seed` (default 42), `--threshold` (default 8.0), `--no-monte-carlo` (disables MC/PT for substituted rings — see "Conformer sampling contract" below).
+CLI knobs that materially change results: `--n-conformers` (default 200), `--mc-steps` (default 500), `--seed` (default 42), `--threshold` (default 8.0), `--no-monte-carlo` (disables MC/PT for substituted rings — see "Conformer sampling contract" below). Progress is shown on stderr by default; `--no-progress` suppresses it without changing results or JSON stdout.
 
 ## Tests
 
@@ -90,11 +90,13 @@ python scripts/diag_homodesmotic.py
 4. **Strain calculation** (`homodesmotic.HomodesmoticAnalyzer.compute_strain`) — two regimes:
    - **Unsubstituted cycloalkanes**: strict bond-balanced reaction `cyclo-(CH₂)ₙ + CH₃CH₃ → CH₃(CH₂)ₙ₊₁CH₃`. Per-ring-size strain is cached at `_CYCLOALKANE_STRAIN_CACHE`.
    - **Substituted**: ring opening at every single ring bond, with canonical-SMILES deduplication so symmetric rings don't pay for equivalent openings. Each unique candidate runs through the full embed + MMFF + (bulk-scaled) PT/MC + Boltzmann pipeline; the lowest-energy acyclic reference is kept.
-5. **Per-term decomposition** — `MMFFCalculator.decompose_energy` toggles `SetMMFFXxxTerm(False)` to extract `{bond, angle, stretch_bend, oop, torsion, vdw, electrostatic}` for both cyclic and acyclic structures; the cyclic-minus-acyclic deltas populate `vdw_strain_kcal_mol / torsion_strain_kcal_mol / angle_strain_kcal_mol / bond_strain_kcal_mol` on `StrainReport`. **The vdW delta is the physically meaningful "true steric" strain** and is what `steric_confinement_kcal_mol` now reports.
+5. **Focused diagnostics** — `GeometryAnalyzer` reports force-field-independent Baeyer angle RMS and counts ring bonds with eclipsed neighbour projections for the Pitzer diagnostic. `MMFFCalculator.compute_vdw_energy` isolates only the vdW contribution for the cyclic and acyclic representative geometries; their difference is exposed as `steric_confinement_kcal_mol`. The former public MMFF94 bond/angle/torsion/vdW decomposition fields are intentionally not reported.
 6. **Calibration** (`calibrate.StrainCalibrator`) — per-ring-size linear correction `calibrated = a[size] * raw + b[size]`, loaded from `ring_strain/calibration_coefficients.json` for instant init. For ring sizes whose unsubstituted reference defines a strain-free anchor (notably cyclohexane = 0), the fit is constrained to pass exactly through `(raw_anchor, 0)`. Sizes with a single reference fall back to the historical multiplicative form. To regenerate after editing the reference set, run `python scripts/derive_calibration.py`.
 7. **Scoring / reference match** — `scoring.StabilityScorer` maps calibrated strain to a 0–100 score (default threshold 8 kcal/mol); `reference.ReferenceDatabase` is queried by canonical SMILES.
 
-Geometry diagnostics (`geometry.GeometryAnalyzer`) run alongside the energy path and contribute Baeyer (angle RMS), Pitzer (eclipsed-torsion count), and transannular-contact fields on the report — they are diagnostic snapshots from the single best conformer and **are not guaranteed to sum to `total_strain_mmff_kcal_mol`** when Boltzmann averaging is active. The same caveat applies to the per-term decomposition.
+Geometry diagnostics (`geometry.GeometryAnalyzer`) run alongside the energy path and contribute Baeyer (angle RMS), Pitzer (eclipsed-ring-bond count), and transannular-contact fields on the report. They are geometric snapshots from the single best conformer. `steric_confinement_kcal_mol` is likewise a representative-geometry vdW difference and is not expected to equal the Boltzmann-averaged total strain.
+
+Long-running analyses emit structured `ProgressUpdate` events through the optional `StrainAnalyzer(..., progress_callback=...)` default or the per-call `analyze(..., progress_callback=...)` override. Events carry the current task, monotonic overall progress, local counters, SMILES, and elapsed wall time. Nested stereoisomer analyses share the root timer. Every returned `StrainReport` includes `elapsed_time_seconds`, and the CLI keeps progress on stderr so `--json` stdout remains machine-readable.
 
 ## Conformer sampling contract (critical)
 

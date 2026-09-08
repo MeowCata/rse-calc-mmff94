@@ -51,6 +51,9 @@ class GeometryAnalyzer:
         self.conf = mol.GetConformer(conf_id)
         if not self.conf.Is3D():
             raise ValueError("Molecule must have a 3D conformer.")
+        # Cache coordinates once; every diagnostic reads the same immutable
+        # optimized geometry and should not rebuild small arrays per atom.
+        self._positions = np.asarray(self.conf.GetPositions(), dtype=float)
 
     # ------------------------------------------------------------------
     # Bond angle (Baeyer) strain
@@ -133,26 +136,28 @@ class GeometryAnalyzer:
     def compute_torsion_angle(
         self, i: int, j: int, k: int, l: int
     ) -> float:
-        """Compute torsion angle i-j-k-l (degrees)."""
-        pos = [self._pos(a) for a in (i, j, k, l)]
+        """Compute a signed torsion angle, or NaN for degenerate geometry."""
+        p0, p1, p2, p3 = self._positions[[i, j, k, l]]
+        b0 = p0 - p1
+        axis = p2 - p1
+        b2 = p3 - p2
+        axis_norm = np.linalg.norm(axis)
+        if axis_norm < 1e-10:
+            return float("nan")
+        axis /= axis_norm
 
-        b1 = pos[1] - pos[0]
-        b2 = pos[2] - pos[1]
-        b3 = pos[3] - pos[2]
+        v = b0 - np.dot(b0, axis) * axis
+        w = b2 - np.dot(b2, axis) * axis
+        v_norm = np.linalg.norm(v)
+        w_norm = np.linalg.norm(w)
+        if v_norm < 1e-10 or w_norm < 1e-10:
+            return float("nan")
+        v /= v_norm
+        w /= w_norm
 
-        n1 = np.cross(b1, b2)
-        n2 = np.cross(b2, b3)
-
-        n1_norm = np.linalg.norm(n1)
-        n2_norm = np.linalg.norm(n2)
-
-        if n1_norm < 1e-10 or n2_norm < 1e-10:
-            return 0.0
-
-        cos_t = np.dot(n1, n2) / (n1_norm * n2_norm)
-        cos_t = np.clip(cos_t, -1.0, 1.0)
-
-        return float(np.degrees(np.arccos(cos_t)))
+        x = float(np.clip(np.dot(v, w), -1.0, 1.0))
+        y = float(np.dot(np.cross(axis, v), w))
+        return float(np.degrees(np.arctan2(y, x)))
 
     def compute_torsion_strain_in_ring(
         self,
@@ -160,51 +165,99 @@ class GeometryAnalyzer:
     ) -> Dict:
         """Compute Pitzer (torsional) strain for a ring.
 
-        Returns torsion angles around each ring bond and identifies
-        eclipsed conformations.
+        Each ring bond is viewed down its bond axis. The closest projected
+        neighbour pair defines its eclipse deviation; a bond is counted once
+        when that deviation is at most 20 degrees. This handles all explicit
+        substituents and avoids the invalid A-B-C-A pseudo-dihedrals that a
+        three-membered ring produces with a backbone-only calculation.
         """
         torsions = []
-        n = len(ring_atoms)
+        ring_set = set(ring_atoms)
+        ring_bonds = sorted(
+            (
+                bond for bond in self.mol.GetBonds()
+                if bond.GetBeginAtomIdx() in ring_set
+                and bond.GetEndAtomIdx() in ring_set
+            ),
+            key=lambda bond: bond.GetIdx(),
+        )
 
-        for idx in range(n):
-            i = ring_atoms[(idx - 1) % n]
-            j = ring_atoms[idx]
-            k = ring_atoms[(idx + 1) % n]
-            l = ring_atoms[(idx + 2) % n]
+        for bond in ring_bonds:
+            j = bond.GetBeginAtomIdx()
+            k = bond.GetEndAtomIdx()
+            axis = self._pos(k) - self._pos(j)
+            axis_norm = np.linalg.norm(axis)
+            if axis_norm < 1e-10:
+                continue
+            axis /= axis_norm
 
-            angle = self.compute_torsion_angle(i, j, k, l)
+            left = [
+                atom.GetIdx()
+                for atom in self.mol.GetAtomWithIdx(j).GetNeighbors()
+                if atom.GetIdx() != k
+            ]
+            right = [
+                atom.GetIdx()
+                for atom in self.mol.GetAtomWithIdx(k).GetNeighbors()
+                if atom.GetIdx() != j
+            ]
 
-            # Categorize torsion
-            if abs(angle) < 20:
+            closest = None
+            for i in left:
+                v = self._pos(i) - self._pos(j)
+                v -= np.dot(v, axis) * axis
+                v_norm = np.linalg.norm(v)
+                if v_norm < 1e-10:
+                    continue
+                v /= v_norm
+
+                for l in right:
+                    if i == l:
+                        continue
+                    w = self._pos(l) - self._pos(k)
+                    w -= np.dot(w, axis) * axis
+                    w_norm = np.linalg.norm(w)
+                    if w_norm < 1e-10:
+                        continue
+                    w /= w_norm
+
+                    x = float(np.clip(np.dot(v, w), -1.0, 1.0))
+                    y = float(np.dot(axis, np.cross(v, w)))
+                    angle = float(np.degrees(np.arctan2(y, x)))
+                    deviation = abs(angle)
+                    if closest is None or deviation < closest[0]:
+                        closest = (deviation, angle, i, l)
+
+            if closest is None:
+                torsions.append({
+                    "bond": (j, k),
+                    "atoms": None,
+                    "angle": None,
+                    "eclipse_deviation": None,
+                    "category": "undefined",
+                })
+                continue
+
+            deviation, angle, i, l = closest
+            if deviation <= 20.0:
                 category = "eclipsed"
-            elif abs(abs(angle) - 120) < 20:
-                category = "eclipsed"
-            elif abs(abs(angle) - 60) < 30:
-                category = "gauche"
-            elif abs(abs(angle) - 180) < 30:
-                category = "anti"
+            elif deviation >= 40.0:
+                category = "staggered"
             else:
                 category = "intermediate"
-
             torsions.append({
+                "bond": (j, k),
                 "atoms": (i, j, k, l),
                 "angle": round(angle, 2),
+                "eclipse_deviation": round(deviation, 2),
                 "category": category,
             })
 
         eclipsed = [t for t in torsions if t["category"] == "eclipsed"]
-        strained = len(eclipsed)
-
-        # Estimate torsional strain energy
-        # ~1 kcal/mol per gauche interaction, ~3 kcal/mol per eclipsed
-        n_gauche = sum(1 for t in torsions if t["category"] == "gauche")
-        estimated_torsional_energy = strained * 3.0 + n_gauche * 1.0
 
         return {
             "torsions": torsions,
-            "n_eclipsed": strained,
-            "n_gauche": n_gauche,
-            "estimated_torsional_energy_kcal_mol": estimated_torsional_energy,
+            "n_eclipsed": len(eclipsed),
         }
 
     # ------------------------------------------------------------------
@@ -288,5 +341,4 @@ class GeometryAnalyzer:
 
     def _pos(self, idx: int) -> np.ndarray:
         """Get 3D position of an atom as numpy array."""
-        pos = self.conf.GetAtomPosition(idx)
-        return np.array([pos.x, pos.y, pos.z])
+        return self._positions[idx]
