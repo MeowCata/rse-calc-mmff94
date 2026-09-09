@@ -16,12 +16,20 @@ calibrate      - MMFF94 to experimental scale calibration
 scoring        - 0-100 stability score
 reference      - Known reference compound database
 geometry       - Geometric strain decomposition
+visualization  - Matplotlib rendering of optimized cyclic conformers
 """
 
 from .core import ProgressUpdate, StrainAnalyzer, StrainReport
 from .reference import ReferenceDatabase, ReferenceCompound
 from .mmff import MMFFCalculator, MMFFResult
 from .scoring import StabilityScorer, StabilityCategory
+from .visualization import (
+    OptimizedConformer,
+    optimize_cyclic_conformer,
+    plot_conformer,
+    ConformerViewer,
+    create_conformer_viewer,
+)
 
 __all__ = [
     "StrainAnalyzer",
@@ -33,4 +41,9 @@ __all__ = [
     "MMFFResult",
     "StabilityScorer",
     "StabilityCategory",
+    "OptimizedConformer",
+    "optimize_cyclic_conformer",
+    "plot_conformer",
+    "ConformerViewer",
+    "create_conformer_viewer",
 ]

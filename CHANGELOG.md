@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-09-09
+
+- Expanded the Matplotlib renderer into an interactive conformer viewer with
+  a conformer slider, hydrogen-visibility toggle, reset-view button, and the
+  standard Matplotlib 3D mouse rotation and zoom controls.
+- Retained energy-sorted low-energy representatives from the production
+  ETKDG/MMFF94 and substituted-ring PT/MC sampling pool. Added symmetry-aware
+  heavy-atom RMSD clustering so explicit-hydrogen rotations and graph-equivalent
+  coordinates are not presented as distinct conformers.
+- Displayed both the MMFF94 conformer energy and its energy relative to the
+  lowest-energy representative. Conformer changes preserve the current camera
+  angle, while reset restores both the default orientation and molecular scale.
+- Changed `scripts/render_conformation.py` to open the interactive viewer when
+  `--output` is omitted; static PNG/SVG/PDF export remains available, and
+  `--show-hydrogens` now also initializes the interactive viewer correctly.
+- Exported `ConformerViewer` and `create_conformer_viewer` from the package API,
+  added ETKDG fallback behavior when optional ring-pucker or PT/MC exploration
+  fails, and closed Matplotlib figures after static export.
+- Verification: `python -m pytest tests/test_visualization.py -q` passed
+  (`5 passed`); Python compilation, TkAgg backend detection, interactive-widget
+  event handling, camera preservation, and CLI static export were also checked.
+
+## 2026-09-08
+
+- Added an optional Matplotlib 3D renderer for the model's optimized cyclic
+  conformers. `scripts/render_conformation.py` runs the production cyclic
+  sampling sequence and renders the selected lowest-energy geometry to PNG,
+  SVG, PDF, or an interactive Matplotlib window.
+
 ## 2026-09-08
 
 - Removed the public MMFF94 per-term energy decomposition from reports, JSON,
